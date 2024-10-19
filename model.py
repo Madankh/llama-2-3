@@ -137,8 +137,8 @@ class SelfAttention(nn.Module):
 
         # (B, 1 , H_Q, Head_Dim) --> (B , H_Q, 1, Head_Dim)
         xq = xq.transpose(1,2)
-        xk = xk.transpose(1,2)
-        xv = xv.transpose(1,2)
+        keys = keys.transpose(1,2)
+        values = values.transpose(1,2)
 
         # (B, H_Q, 1, Head_Dim) @ (B, H_Q, Head_Dim, Seq_Len_KV) -> (B, H_Q, 1, Seq_Len_KV)
         scores = torch.matmul(xq, keys.transpose(2,3))/math.sqrt(self.head_dim)
@@ -153,6 +153,16 @@ class SelfAttention(nn.Module):
         output = (output.transpose(1,2).contiguous().view(batch_size, seq_len, -1))
         
         return self.wo(output)
+
+
+class FeedForward(nn.Module):
+    def __init__(self, args:ModelArgs):
+        super().__init__()
+        hidden_dim = 4 * args.dim 
+        hidden_dim = int(2*hidden_dim/3)
+
+
+
 
 class EncoderBlock(nn.Module):
     def __init__(self, args:ModelArgs):
