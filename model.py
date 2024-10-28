@@ -10,10 +10,10 @@ class ModelArgs:
     dim:int = 4096
     n_layers: int = 32
     n_heads : int = 32
-    n_kv_heads = Optional[int] = None
+    n_kv_heads : Optional[int] = None
     vocab_size:int = -1
     multiple_of :int=256
-    ffn_dim_multiplier = Optional[float] = None
+    ffn_dim_multiplier : Optional[float] = None
     norm_eps:float = 1e-5
 
     # Needed fir kv_cache
@@ -164,7 +164,7 @@ class FeedForward(nn.Module):
         if args.ffn_dim_multiplier is not None:
             hidden_dim = int(args.ffm_dim_multiplier * hidden_dim)
         # Round the hidden_dim to the nearest multiple of hte multiple_of parameters
-        hidden = args.multiple_of * ((hidden + args.multiple_of - 1)//args.multiple_of)
+        hidden_dim = args.multiple_of * ((hidden_dim + args.multiple_of - 1)//args.multiple_of)
 
         self.w1 = nn.Linear(args.dim, hidden_dim, bias=False)
         self.w2 = nn.Linear(hidden_dim, args.dim, bias=False)
