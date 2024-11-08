@@ -33,3 +33,37 @@ class LLaMa:
             device=device,
             **params
         )
+
+        tokenizer = SentencePieceProcessor()
+        tokenizer.load(tokenizer_path)
+        model_args.vocab_size = tokenizer.vocab_size()
+
+        if device == "cuda":
+            torch.set_default_tensor_type(torch.cuda.HalfTensor)
+        else:
+            torch.set_default_tensor_type(torch.BFloat16Tensor)
+
+        model = Transformer(model_args).to(device)
+
+        if load_model:
+            del checkpoint["rope.freqs"]
+            model.load_state_dict(checkpoint, strict=True)
+            print(f"Loaded state dict in {(time.time() - prev_time)}")
+
+        return LLaMa(model, tokenizer, model_args)
+if __name__ == '__main__':
+    torch.manual_seed(0)
+    
+    allow_cuda = False
+    device = "cuda" if torch.cuda.is_available() and allow_cuda else 'cpu'
+
+    model = LLaMa.build(
+        checkpoints_dir='llama-2-7b/',
+        tokenizer_path='tokenizer.model',
+        load_model=True,
+        max_seq_len=1024,
+        max_batch_size=3,
+        device=device
+    )
+
+    print("ALL GOOD")

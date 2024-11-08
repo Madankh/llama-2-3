@@ -39,4 +39,8 @@ class RMSNorm(torch.nn.Module):
 def precompute_freqs_cis(dim:int, end:int, theta:float = 10000.0):
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim//2)].float()/dim))
     t = torch.arange(end, device=freqs.device)
+    freqs=  torch.outer(t,  freqs).float()
+    freqs_cos = torch.cos(freqs) # real part
+    freqs_sin = torch.sin(freqs) # imaginary part
+    return  freqs_cos , freqs_sin
     
