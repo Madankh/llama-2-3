@@ -50,21 +50,21 @@ def apply_rotary_embeddings(x:torch.Tensor, freqs_complex:torch.Tensor, device:s
     freqs_complex = freqs_complex.unsqueeze(0).unsqueeze(2)
     x_rotated = x_complex * freqs_complex
     x_out = torch.view_as_real(x_rotated)
-    x_out = x.out.reshape(*x.shape)
+    x_out = x_out.reshape(*x.shape)
     return x_out.type_as(x).to(device)
 
 class RMSNorm(nn.Module):
     def __init__(self, dim:int,eps:float=1e-6):
         super().__init__()
         self.eps = eps
-        self.gamma = nn.Parameter(torch.ones(dim))
+        self.weight = nn.Parameter(torch.ones(dim))
     
     def _norm(self, x:torch.Tensor):
         # (B , S, D) * (B, S, 1) = (B, S, D)
         # rsqrt: 1/sqrt(x)
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
     def forward(self, x:torch.Tensor):
-        return self.gamma * self._norm(x.float()).type_as(x)
+        return self.weight * self._norm(x.float()).type_as(x)
 
 
 def repeat_kv(x:torch.Tensor, n_rep:int)-> torch.Tensor:
@@ -94,8 +94,8 @@ class SelfAttention(nn.Module):
         self.head_dim = args.dim // args.n_heads
 
         self.wq = nn.Linear(args.dim, args.n_heads * self.head_dim, bias=False)
-        self.wk = nn.Linear(args.dim, args.n_kv_heads * self.head_dim, bias=False)
-        self.wv = nn.Linear(args.dim, args.n_kv_heads * self.head_dim, bias=False)
+        self.wk = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
+        self.wv = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
         self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim,bias=False)
 
         self.cache_k = torch.zeros((args.max_batch_size, args.max_seq_len, self.n_kv_heads, self.head_dim))
@@ -209,7 +209,7 @@ class Transformer(nn.Module):
         self.args = args
         self.vocab_size = args.vocab_size
         self.n_layers = args.n_layers
-        self.tok_embedding = nn.Embedding(self.vocab_size, args.dim)
+        self.tok_embeddings = nn.Embedding(self.vocab_size, args.dim)
 
         self.layers = nn.ModuleList()
         for _ in range(args.n_layers):
@@ -225,7 +225,7 @@ class Transformer(nn.Module):
         assert seq_len == 1, "Only one token at a time can be processed"
 
         # (B, Seq_len) -> (B, seq_len, Dim)
-        h = self.tok_embedding(tokens)
+        h = self.tok_embeddings(tokens)
 
         # Retrieve the pairs (m, theta) corresponding to the position [start_pos, start_pos+seq_len]
         freqs_complex = self.freqs_complex[start_pos:start_pos+seq_len]
