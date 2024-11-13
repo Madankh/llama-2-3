@@ -100,6 +100,6 @@ class Attention(nn.Module):
         self.n_local_kv_heads = args.n_kv_heads // model_parallel_size
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
         self.head_dim = args.dim // args.n_heads
-        self.wq = nn.Linear(args.dim, args.n_heads * self.head_dim)
-        self.wk = nn.Linear(args.dim , args.n_kv_heads * self.head_dim)
-        self.wv = nn.Linear()
+        self.wq = nn.Linear(args.dim, args.n_heads * self.head_dim, bias=False)
+        self.wk = nn.Linear(args.dim , args.n_kv_heads * self.head_dim, bias=False)
+        self.wv = nn.Linear(args.dim, args.n_kv_heads * self.head_dim, bias=False)
