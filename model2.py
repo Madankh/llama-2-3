@@ -130,4 +130,23 @@ class Attention(nn.Module):
 
             # Rope relative position embedding
             xq, xk = apply_rotary_emb(xq, xk, freqs_cos, freqs_sin)
+
+            # Grouped multiquery attention: expand out keys and values
+            xk = repeat_kv(xk, self.n_rep) # (bs, seqlen, n_local_heads, head_dim)
+            xv = repeat_kv(xv, self.n_rep)
+
+            # make heads into batch dimension
+            xq = xq.transpose(1,2) # (bs, n_local_heads, seqlen, head_dim)
+            xk = xk.transpose(1,2)
+            xv = xv.transpose(1,2)
+
+            # flash implementation
+            if self.flash:
+                output = torch.nn.functional.scaled_dot_product_attention(xq, xk ,xv, attn_mask=None, dropout_p=self.dropout if self.traning else 0.0, is_causal=True)
+            else:
+                # manual implementation
+                scores = torch.matmul(xq, xk.transpose(2,3)) / math.sqrt(self.head_dim)
+                assert hasattr(self, 'mask')
+                scores = scores + self.mask[:,:,:seqlen, :seqlen]
+
             
