@@ -103,3 +103,31 @@ class Attention(nn.Module):
         self.wq = nn.Linear(args.dim, args.n_heads * self.head_dim, bias=False)
         self.wk = nn.Linear(args.dim , args.n_kv_heads * self.head_dim, bias=False)
         self.wv = nn.Linear(args.dim, args.n_kv_heads * self.head_dim, bias=False)
+        self.wo = nn.Linear(args.n_heads*self.head_dim, args.dim, bias=False)
+        self.attn_dropout = nn.Dropout(args.dropout)
+        self.resid_dropout = nn.Dropout(args.dropout)
+        self.dropout = args.dropout
+
+        # use flash attention or a manual implementatioon
+        if not self.flash:
+            print("WARNING: using slow attention, flash attention require pytorch >= 2.0")
+            mask = torch.full((1,1,args.max_seq_len, args.max_seq_len))
+            mask = torch.triu(mask, diagonal=1)
+            self.register_buffer("mask", mask)
+        
+        def forward(
+                self, 
+                x:torch.Tensor, 
+                freqs_cos:torch.Tensor,
+                freqs_sin:torch.Tensor,
+            ):
+            bsz, seqlen = x.shape
+            # QKV
+            xq,xk,xv = self.wq(x), self.wk(x), self.wv(x)
+            xq = xq.view(bsz, seqlen , self.n_local_heads, self.head_dim)
+            xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+            xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+
+            # Rope relative position embedding
+            xq, xk = apply_rotary_emb(xq, xk, freqs_cos, freqs_sin)
+            
