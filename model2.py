@@ -148,5 +148,52 @@ class Attention(nn.Module):
                 scores = torch.matmul(xq, xk.transpose(2,3)) / math.sqrt(self.head_dim)
                 assert hasattr(self, 'mask')
                 scores = scores + self.mask[:,:,:seqlen, :seqlen]
-
+                scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+                scores = self.attn_dropout(scores)
+                output = torch.matmul(scores, xv)
             
+            output = output.transpose(1,2).contiguous().view(bsz, seqlen, -1)
+            # final projection into residual stream
+            output = self.wo(output)
+            output = self.resid_dropout(output)
+            return output
+
+        
+class FeedForward(nn.Module):
+    def __init__(self, dim:int, hidden_dim:int, mutiple_of:int , dropout:float):
+        super().__init__()
+        if hidden_dim is None:
+           hidden_dim = 4 * dim
+           hidden_dim = int(2*hidden_dim/3)
+           hidden_dim = mutiple_of * ((hidden_dim + mutiple_of - 1) // mutiple_of)
+        self.w1 = nn.Linear(dim, hidden_dim, bias=False)
+        self.w2 = nn.Linear(hidden_dim, dim, bias=False)
+        self.w3 = nn.Linear(dim, hidden_dim, bias=False)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self,x):
+        return self.dropout(self.w2(F.silu(self.w1(x)) * self.w3(x)))
+
+class TransformerBlock(nn.Module):
+    def __init__(self, layer_id:int, args:ModelArgs):
+        super().__init__()
+        self.n_heads = args.n_heads
+        self.dim = args.dim
+        self.head_dim = args.dim // args.n_heads
+        self.attention = Attention(args)
+        self.feed_forward = FeedForward(
+            dim=args.dim,
+            hidden_dim=args.hidden_dim,
+            mutiple_of=args.multiple_of,
+            dropout=args.dropout
+        )
+        self.layer_id = layer_id,
+        self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
+        # Normalization Before the feed forward block
+        self.ffn_norm = RMSNorm(args.dim, eps = args.norm_eps)
+
+    def forward(self, x:torch.Tensor, start_pos:int, freqs_complex:torch.Tensor):
+        # (B, Seq_len, Dim)
+        h = x + self.attention.forward(self.attention_norm(x), start_pos, freqs_complex)
+        out = h + self.feed_forward.forward(self.ffn_norm(h))
+        return out
