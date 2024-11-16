@@ -241,29 +241,67 @@ class TransformerBlock(nn.Module):
     def __init__(self, layer_id:int, args:ModelArgs):
         super().__init__()
         self.n_heads = args.n_heads
-
         self.dim = args.dim
-
         self.head_dim = args.dim // args.n_heads
-
         self.attention = Attention(args)
-
         self.feed_forward = FeedForward(
             dim=args.dim,
             hidden_dim=args.hidden_dim,
             mutiple_of=args.multiple_of,
             dropout=args.dropout
         )
-
         self.layer_id = layer_id,
-
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
         # Normalization Before the feed forward block
         self.ffn_norm = RMSNorm(args.dim, eps = args.norm_eps)
 
-    def forward(self, x:torch.Tensor, start_pos:int, freqs_complex:torch.Tensor):
+    def forward(self, x, freqs_cos, freqs_sin):
         # (B, Seq_len, Dim)
-        h = x + self.attention.forward(self.attention_norm(x), start_pos, freqs_complex)
-
+        h = x + self.attention.forward(self.attention_norm(x), freqs_cos, freqs_sin)
         out = h + self.feed_forward.forward(self.ffn_norm(h))
         return out
+    
+class Transformer(nn.Module):
+    last_loss : Optional[torch.Tensor]
+
+    def __init__(self, params:ModelArgs):
+        super().__init__()
+        self.params = params
+        self.vocab_size = params.vocab_size
+        self.n_layers = params.n_layers
+
+        self.tok_embeddings = nn.Embedding(params.vocab_size, params.dim)
+        self.dropout = nn.Dropout(params.dropout)
+        self.layers = torch.nn.ModuleList()
+        for layer_id in range(params.n_layers):
+            self.layers.append(TransformerBlock(layer_id, params))
+        self.norm =  RMSNorm(params.dim, eps=params.norm_eps)
+        self.output = nn.Linear(params.dim, params.vocab_size, bias=False))
+
+        # share the unemdedding parameters with the embedding parameters
+        self.tok_embeddings.weight = self.output.weight
+
+        # some useful precompute for the RoPE relative positional embedding
+        freqs_cos, freqs_sin = precompute_freqs_cis(self.params.dim//self.params.n_heads, self.params.max_seq_len)
+        self.register_buffer("freqs_cos", freqs_cos, persistent=False)
+        self.register_buffer("freqs_sin", freqs_sin, persistent=False)
+
+        # init all weights
+        self.apply(self._init_weights)
+        # apply special scaled init to the residual projections per GPT-2 paper
+        for pn, p in self.named_parameters():
+            if pn.endswith('w3.weight') or pn.endswith('wo.weight'):
+                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2*params.n_layers))
+        # Initialize attribute for the loss of the last forward call. This will be set if the forward is called with a targets tensor.
+        self.last_loss = None
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+    
+    def forward(self, x):
+        _bsz, seqlen =  x.shape
