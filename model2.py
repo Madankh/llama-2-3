@@ -303,5 +303,22 @@ class Transformer(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
     
-    def forward(self, x):
-        _bsz, seqlen =  x.shape
+    def forward(self, tokens:torch.Tensor, targets:Optional[torch.Tensor] = None):
+        _bsz, seqlen =  tokens.shape
+        h = self.tok_embeddings(tokens)
+        h = self.dropout(h)
+        freqs_cos = self.freqs_cos[:seqlen]
+        freqs_sin = self.freqs_sin[:seqlen]
+
+        for layer in self.layers:
+            h = layer(TransformerBlock(h, freqs_cos, freqs_sin))
+        h = self.norm(h)
+
+        if targets is not None:
+            # if we are given some desired targets also calculate the loss
+            logits = self.output(h)
+            self.last_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+        else:
+            logits = self.output(h[:,[-1],:]) # note: using list [-1] to preserve the time dim
+            self.last_loss = None
+        return logits
