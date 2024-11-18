@@ -322,3 +322,19 @@ class Transformer(nn.Module):
             logits = self.output(h[:,[-1],:]) # note: using list [-1] to preserve the time dim
             self.last_loss = None
         return logits
+    
+    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+        # start with all of the candidate parameters
+        params_dict = {pn : p for pn, p in self.parameters()}
+        # filter out those that do not require grad
+        params_dict = {pn : p for pn , p in params_dict.items() if p.requires_grad}
+        # create optim groups. any parameters that is 2d will be weight decayed , otherwise no 
+        # i.e all weight tensors in matmuls + embeddings decay , all biases and layernorms don't 
+        decay_params = [p for n , p in params_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in params_dict.items() if p.dim() < 2]
+
+        optim_groups = [
+            {"params":decay_params, "weight_decay":weight_decay},
+            {"params":nodecay_params, "weight_decay" : 0.0}
+        ]
+        
