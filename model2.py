@@ -23,7 +23,7 @@ class ModelArgs:
     max_seq_len = 2048
     dropout:float = 0.0
 
-class RMSNorm(torch.nn.Module):
+class RMSNorm(nn.Module):
     def __init__(self, dim:int, eps:float):
         super().__init__()
         self.eps = eps
