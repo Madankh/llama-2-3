@@ -337,4 +337,64 @@ class Transformer(nn.Module):
             {"params":decay_params, "weight_decay":weight_decay},
             {"params":nodecay_params, "weight_decay" : 0.0}
         ]
-        
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        print(f"num decayed parameter tensors : {len(decay_params)}")
+        print(f"num nodecayed parameters tensor : {len(nodecay_params)}")
+
+        # Create AdamW optimizer and use the fused version if it is available
+        fused_avaiable = "fused" in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_avaiable and device_type=='cuda'
+        extra_args = dict(fused = True) if use_fused else dict()
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, **extra_args)
+        return optimizer
+    
+    def estimate_mfu(self, fwdbwd_per_iter, dt):
+        """
+        estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS
+        """
+        # First estimate the number of flops we do per iteration
+        # see PaLM paper Appendix B as ref: https://arxiv.org/abs/2204.02311
+        N = sum(p.numel() for p in self.parameters())
+        cfg = self.params
+        L, H, Q, T = cfg.n_layers, cfg.n_heads, cfg.dim//cfg.n_heads, cfg.max_seq_len
+        flops_per_token = 6 * N + 12 * L * H * Q * T
+        flops_per_fwdbwd  =  flops_per_token * T
+        flops_per_iter  = flops_per_fwdbwd * fwdbwd_per_iter
+        flops_achieved  = flops_per_iter * (1.0/dt) # per second
+
+        flops_promised = 312e12 
+        mfu = flops_achieved / flops_promised
+        return mfu
+    
+    @torch.inference_mode()
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+        """
+        Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
+        the sequence max_new_tokens times, feeding the predictions back into the model each time.
+        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
+        Also note this is a super inefficient version of sampling with no key/value cache.
+        """
+        for _ in range(max_new_tokens):
+            # if the sequence context is growing too long we must crop it at block_size
+            idx_cond = idx if idx.size(1) <= self.params.max_seq_len else idx[:, -self.params.max_seq_len:]
+            # forward the model to get the logits for the index in the sequence
+            logits = self(idx_cond)
+            logits = logits[:, -1, :] # crop to just the final time step
+            if temperature == 0.0:
+                # "sample" the single most likely index
+                _, idx_next = torch.topk(logits, k=1, dim=-1)
+            else:
+                # pluck the logits at the final step and scale by desired temperature
+                logits = logits / temperature
+                # optionally crop the logits to only the top k options
+                if top_k is not None:
+                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                    logits[logits < v[:, [-1]]] = -float('Inf')
+                # apply softmax to convert logits to (normalized) probabilities
+                probs = F.softmax(logits, dim=-1)
+                idx_next = torch.multinomial(probs, num_samples=1)
+            # append sampled index to the running sequence and continue
+            idx = torch.cat((idx, idx_next), dim=1)
+
+        return idx
