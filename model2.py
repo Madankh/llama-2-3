@@ -339,8 +339,8 @@ class Transformer(nn.Module):
         ]
         num_decay_params = sum(p.numel() for p in decay_params)
         num_nodecay_params = sum(p.numel() for p in nodecay_params)
-        print(f"num decayed parameter tensors : {len(decay_params)}")
-        print(f"num nodecayed parameters tensor : {len(nodecay_params)}")
+        print(f"num decayed parameter tensors : {len(decay_params)}, with {num_decay_params}")
+        print(f"num nodecayed parameters tensor : {len(nodecay_params)} with {num_nodecay_params}")
 
         # Create AdamW optimizer and use the fused version if it is available
         fused_avaiable = "fused" in inspect.signature(torch.optim.AdamW).parameters
