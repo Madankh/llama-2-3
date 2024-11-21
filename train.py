@@ -128,3 +128,19 @@ torch.backends.cuda.allow_tf32 = True
 device_type = "cuda" if "cuda" in device else "cpu"
 ptdtype = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}[dtype]
 
+ctx = (
+    nullcontext()
+    if device_type == "cpu"
+    else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
+)
+
+# task-specific setup
+iter_batches = partial(
+    Task.iter_batches,
+    batch_size=batch_size,
+    max_seq_len=max_seq_len,
+    vocab_size=vocab_size,
+    vocab_source=vocab_source,
+    device=device,
+    num_workers=0,
+)
