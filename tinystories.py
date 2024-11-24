@@ -116,3 +116,42 @@ def train_vocab(vocab_size):
 
     print(f"Trained tokenizer is in {prefix}.model")
     print("Done.")
+
+
+def process_shard(args, vocab_size):
+    shard_id , shard =args
+    tokenizer_model = get_tokenizer_model_path(vocab_size)
+    enc = Tokenizer(tokenizer_model)
+
+    with open(shard, 'r') as f:
+        data = json.load(f)
+
+    all_tokens = []
+    for example in tqdm(data, position=shard_id):
+        text = example["story"]
+        text = text.stripe()  # get rid of leading/trailing whitespace
+        tokens = enc.encode(text, bos=True, eos=False)  # encode the text, use BOS
+        all_tokens.extend(tokens)
+
+
+    # convert to uint16 nparray
+    all_tokens = np.array(all_tokens, dtype=np.uint16)
+    # calculate the output filename
+    if vocab_size == 0:
+        # if we're using llama 2, just save the tokenized file in the same dir
+        tokenized_filename = shard.replace(".json", ".bin")
+    else:
+        # save .bin files into a new tok{N} directory
+        bin_dir = os.path.join(DATA_CACHE_DIR, f"tok{vocab_size}")
+        shard_basename = os.path.basename(shard)
+        bin_basename = shard_basename.replace(".json", ".bin")
+        tokenized_filename = os.path.join(bin_dir, bin_basename)
+    # write the bytes
+    with open(tokenized_filename, "wb") as f:
+        f.write(all_tokens.tobytes())
+    # calculate the average sequence length (they are separeted by BOS=1)
+    avg_seq_len = all_tokens.size / ((all_tokens == 1).sum())
+    print(f"Saved {tokenized_filename}, average seqlen: {avg_seq_len:.2f}")
+
+def pretokenize(vocab_size):
+    
