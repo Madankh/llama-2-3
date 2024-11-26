@@ -11,6 +11,7 @@ import requests
 import sentencepiece as spm
 import torch
 import torch.distributed as dist
+import torch.utils
 from tqdm import tqdm
 import json
 
@@ -154,4 +155,20 @@ def process_shard(args, vocab_size):
     print(f"Saved {tokenized_filename}, average seqlen: {avg_seq_len:.2f}")
 
 def pretokenize(vocab_size):
-    
+    """Loads pretokenized examples from disk and yields them as Pytorch Tensor."""
+
+    def __init__(self,split, max_seq_len, vocab_size, vocab_source):
+        super().__init__()
+        self.split = split
+        self.max_seq_len = max_seq_len
+        self.vocab_size = vocab_size
+        self.vocab_source = vocab_source
+
+    def __iter__(self):
+        # get worker info within a DataLoader
+        worker_info = torch.utils.data.get_worker_info()
+        worker_id = worker_info.id if worker_info else 0
+
+        # get DDP rank info
+        rank = dist.get() if dist.is_initialized() else 0
+        
