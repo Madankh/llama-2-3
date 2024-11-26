@@ -154,7 +154,24 @@ def process_shard(args, vocab_size):
     avg_seq_len = all_tokens.size / ((all_tokens == 1).sum())
     print(f"Saved {tokenized_filename}, average seqlen: {avg_seq_len:.2f}")
 
+
 def pretokenize(vocab_size):
+    # iterate the shards and tokenize all of them one by one
+    data_dir = os.path.join(DATA_CACHE_DIR, "TinyStories_all_data")
+    shard_filenames = sorted(glob.glob(os.path.join(data_dir, "*.json")))
+    if vocab_size > 0:
+        # .bin files will be saved into tok{N} directory, create it once here
+        bin_dir = os.path.join(DATA_CACHE_DIR, f"tok{vocab_size}")
+        os.makedirs(bin_dir, exist_ok=True)
+
+    # process all the shards in a process pool
+    fun = partial(process_shard, vocab_size=vocab_size)
+    with ProcessPoolExecutor() as executor:
+        executor.map(fun, enumerate(shard_filenames))
+    print("Done.")
+
+
+class PretokDataset(torch.utils.data.IterableDataset):
     """Loads pretokenized examples from disk and yields them as Pytorch Tensor."""
 
     def __init__(self,split, max_seq_len, vocab_size, vocab_source):
@@ -171,4 +188,91 @@ def pretokenize(vocab_size):
 
         # get DDP rank info
         rank = dist.get() if dist.is_initialized() else 0
-        
+        # combine the worker_id and worker_rank to create a unique seed for rng
+        seed = 42 + worker_id + 1337 * rank
+        rng = random.Random(seed)
+        print(f"Created a PretokDataset with rng seed {seed}")
+        if self.vocab_source == "llama2":
+            # THE .bin files are right along the .json files
+            bin_dir = os.path.join(DATA_CACHE_DIR, "TinyStories_all_data")
+            shard_filenames = sorted(glob.glob(os.path.join(bin_dir, "*.bin")))
+        elif self.vocab_source == "custom":
+            # the .bin files are in tok{N} directory
+            bin_dir = os.path.join(DATA_CACHE_DIR, f"tok{self.vocab_size}")
+            shard_filenames = sorted(glob.glob(os.path.join(bin_dir, "*.bin")))
+        # Train/test split. let's use only shard 0 for test split rest train
+        shard_filenames = shard_filenames[1:] if self.split == "train" else 0
+        assert len(shard_filenames) > 0, f"No bin files found in {bin_dir}"
+
+        while True:
+            rng.shuffle(shard_filenames)
+            for shard in shard_filenames:
+                # open the dataset for reading but keep it on disk with memmap
+                m = np.memmap(shard, dtype=np.uint16, mode="r")
+                num_batches = len(m)//self.max_seq_len
+                num_batches -= 1 # drop the last partial batch
+                assert num_batches > 0, "this shard is way too small? investigate."
+                ixs = list(range(num_batches))
+                rng.shuffle(ixs)
+                for ix in ixs:
+                    start = ix * self.max_seq_len
+                    end = start + self.max_seq_len + 1
+                    # calling .astype will copy the data into a new numpy array , now in Ram
+                    chunk = torch.from_numpy((m[start:end]).astype(np.int64))
+                    x = chunk[:-1]
+                    y = chunk[1:]
+                    yield x, y
+
+
+def get_tokenizer_model_path(vocab_size):
+    """
+    Returns path to the sentencepiece tokenizer model for a given vocab size
+    vocab_size = 0 designates the default Llama 2 tokenizer, in that case
+    None is returned.
+    """
+    if vocab_size == 0:
+        return None
+    else:
+        return os.path.join(DATA_CACHE_DIR, f"tok{vocab_size}.model")
+
+class Task:
+
+    @staticmethod
+    def iter_batches(batch_size, device, num_workers=0, **dataset_kwargs):
+        ds = PretokDataset(**dataset_kwargs)
+        dl = torch.utils.data.DataLoader(
+            ds, batch_size=batch_size, pin_memory=True, num_workers=num_workers
+        )
+        for x, y in dl:
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+            yield x, y
+
+
+if __name__ == "__main__":
+    """
+    These stages are designed to be run in order.
+
+    To tokenize data with the Llama 2 tokenizer:
+    python tinystories.py download
+    python tinystories.py pretokenize
+
+    To tokenize data with a custom tokenizer we train ourselves with sentencepiece, e.g.:
+    python tinystories.py download
+    python tinystories.py train_vocab --vocab_size=2048
+    python tinystories.py pretokenize --vocab_size=2048
+    """
+    parser = argparse.ArgumentParser()
+    parser.add_argument("stage", type=str, choices=["download", "pretokenize", "train_vocab"])
+    parser.add_argument("--vocab_size", type=int, default=0, help="pretokenization vocab size. 0 = use Llama 2 tokenizer.")
+    args = parser.parse_args()
+
+    # depending on the stage call the appropriate function
+    if args.stage == "download":
+        download()
+    elif args.stage == "train_vocab":
+        train_vocab(vocab_size=args.vocab_size)
+    elif args.stage == "pretokenize":
+        pretokenize(vocab_size=args.vocab_size)
+    else:
+        raise ValueError(f"Unknown stage {args.stage}")
