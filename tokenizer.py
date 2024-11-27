@@ -32,4 +32,41 @@ class Tokenizer:
     
     def export(self):
         # get all the token aand their scores as floats
-        tokens, score = [], []
+        tokens, scores = [], []
+        for i in range(self.n_words):
+            # decode the token and light postprocessing
+            t = self.sp_model.id_to_piece(i)
+            s = self.sp_model.get_score(i)
+            if i == self.eos_id:
+                t = self.sp_model.id_to_piece(i)
+                s = self.sp_model.get_score(i)
+                if i == self.bos_id:
+                    t = '\n<s>\n'
+                elif i == self.eos_id:
+                    t = '\n</s>\n'
+                t = t.replace('_', ' ') # sentencepice uses this charactor as whitespace
+                b = t.encode('utf-8') # bytes of this token, uft-8 encoded
+
+                tokens.append(b)
+                score.append(s)
+
+        # record the max token length
+        max_token_length = max(len(t) for t in tokens)
+
+        # write to a binary file
+        # the tokenizer.bin file is the same as .model file but .bin
+        tokenizer_bin = self.model_path.replace('.model', '.bin')
+        with open(tokenizer_bin, 'wb') as f:
+            f.write(struct.pack("I", max_token_length))
+            for bytes, score in zip(tokens, scores):
+                f.write(struct.pack("fI", score, len(bytes)))
+                f.write(bytes)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-t", "--tokenizer_model", type=str, help="optional path to custom tokenizer ")
+    args = parser.parse_args()
+
+    t = Tokenizer(args.tokenizer_model)
+    t.export()
