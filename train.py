@@ -144,3 +144,107 @@ iter_batches = partial(
     device=device,
     num_workers=0,
 )
+
+# init these up here, can overide if init_from='resume' (i.e from checkpoint)
+iter_num = 0
+best_val_loss = 1e9
+# model init
+model_args = dict(
+    dim=dim,
+    n_layers=n_layers,
+    n_heads=n_heads,
+    n_kv_heads=n_kv_heads,
+    vocab_size=vocab_size,
+    multiple_of=multiple_of,
+    max_seq_len=max_seq_len,
+    dropout=dropout,
+) # start with model_args from command line
+
+if init_from == "scratch":
+    # init a new model from scratch
+    print("Initializing a new model from scratch")
+    gptconf = ModelArgs(**model_args)
+    model = Transformer(gptconf)
+elif init_from == "resume":
+    print(f"Resuming training from {out_dir}")
+    # resume traning from checkpoint
+    ckpt_path = os.path.join(out_dir, "ckpt.pt")
+    checkpoint = torch.load(ckpt_path, map_location=device)
+    checkpoint_model_args = checkpoint["model_args"]
+    # force these config attributes to be equal otherwise we can't even resume training
+    # the rest of the attributes (e.g. dropout) can stay as desired from command line
+    for k in ["dim", "n_layers", "n_heads", "n_kv_heads", "vocab_size", "multiple_of", "max_seq_len"]:
+        model_args[k] =  checkpoint_model_args[k]
+    # create the model
+    gptconf  = ModelArgs(**model_args)
+    model = Transformer(gptconf) 
+    state_dict = checkpoint["model"]
+    # fix the keys of the state dictionary
+    # honestly no idea how checkpoints sometimes get this prefix, have to debug more
+    unwanted_prefix = "_orig_mod."
+    for k, v in list(state_dict.items()):
+        if k.startswith(unwanted_prefix):
+            state_dict[k[len(unwanted_prefix) :]] = state_dict.pop(k)
+    model.load_state_dict(state_dict)
+    iter_num = checkpoint["iter_num"]
+    best_val_loss = checkpoint["best_val_loss"]
+model.to(device)
+
+# Initializa a GradScaler. If enabled=False scaler is no-op
+scaler = torch.cuda.amp.GradScaler(enabled=(dtype=="float16"))
+
+# optimizer
+optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
+if init_from == "resume" and "optimizer" in checkpoint:
+    optimizer.load_state_dict(checkpoint["optimizer"])
+checkpoint = None # free up memory
+
+# compile the model
+if compile:
+    print("compiling the model... (takes a ~minute)")
+    unoptimized_model = model
+    model = torch.compile(model) # require Pytorch 2.0
+ 
+# warp model into DDP container
+if ddp:
+    # Ignore the `freqs_cis` buffer so that DDP does not broadcast it at
+    # construction time since NCCL does not support `ComplexFloat`
+    prefix = "_orig_mod." if compile else ""
+    model._ddp_params_and_buffers_to_ignore = {prefix + "freqs_cis"}
+    model = DDP(model, device_ids=[ddp_local_rank])
+
+
+@torch.no_grad()
+def estimate_loss():
+    out = {}
+    model.eval()
+    for split in ["train", "val"]:
+        batch_iter = iter_batches(split=split)
+        losses = torch.zeros(eval_iters) # keep on CPU
+        for k in range(eval_iters):
+            X, Y = next(batch_iter)
+            with ctx:
+                logits = model(X, Y)
+                loss = raw_model.last_loss
+            losses[k] = loss.item()
+        out[split] = losses.mean()
+    model.train()
+    return out
+
+# learning rate decay scheduler (cosine with warmup)
+def get_lr(it):
+    # 1) linear warmup for warmp_iters steps
+    if it < warmup_iters:
+        return learning_rate * it / warmup_iters
+    # 2) if it > lr_decay_iters, return min learning rate 
+    if it > lr_decay_iters:
+        return min_lr
+    
+    # in between use cosine decay down to min
+    decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
+    assert 0<= decay_ratio <=1
+
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
+    return min_lr + coeff * (learning_rate - min_lr)
+
+
