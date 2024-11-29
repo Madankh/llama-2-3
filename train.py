@@ -248,3 +248,66 @@ def get_lr(it):
     return min_lr + coeff * (learning_rate - min_lr)
 
 
+# loggingg
+if wandb_log and master_process:
+    import wandb
+    wandb.init(project=wandb_project, name=wandb_run_name, config=config)
+
+# traning loop
+train_batch_iter = iter_batches(split="train")
+X, Y = next(train_batch_iter) # fetch the very first batch
+t0 = time.time()
+local_iter_num = 0
+raw_model = model.module if ddp else model # unwrap DDP container if needed
+running_mfu = -1.0
+while True:
+    # determine and set the learning rate for this interation
+    lr = get_lr(iter_num) if decay_lr else learning_rate
+    for param_group in optimizer.param_groups:
+        param_group["lr"] = lr
+
+    # evaluate the loss on train/val sets and write checkpoints
+    if iter_num % eval_interval == 0 and master_process:
+        losses = estimate_loss()
+        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        if wandb_log:
+            try:
+                wandb.log(
+                    {
+                        "iter": iter_num,
+                        "tokens": iter_num * tokens_per_iter,
+                        "loss/train": losses["train"],
+                        "loss/val": losses["val"],
+                        "lr": lr,
+                        "mfu": running_mfu * 100,  # convert to percentage
+                    }, step = iter_num
+                )
+            except Exception as e:
+                print(f"logging to wandb failed: {e}")
+        if losses["val"] < best_val_loss or always_save_checkpoint:
+            best_val_loss = losses["val"]
+            if iter_num > 0:
+                checkpoint = {
+                    "model": raw_model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "model_args": model_args,
+                    "iter_num": iter_num,
+                    "best_val_loss": best_val_loss,
+                    "config": config,
+                }
+                print(f"saving checkpoint to {out_dir}")
+                torch.save(checkpoint, os.path.join(out_dir, "ckpt.pt"))
+                model_export(raw_model, os.path.join(out_dir, "model.bin"), version=0)
+        if iter_num == 0 and eval_only:
+            break
+
+        # forward backward update, with optional gradient accumulation to simulate larger batch size
+        # and using the GradScaler if data type is float16
+        for micro_step in range(gradient_accumulation_steps):
+            if ddp:
+                model.require_backward_grad_sync = micro_step == gradient_accumulation_steps
+            with ctx:
+                logits = model(X, Y)
+                loss = raw_model.last_loss
+                loss = loss / gradient_accumulation_steps
+                
