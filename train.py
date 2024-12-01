@@ -305,6 +305,7 @@ while True:
         # and using the GradScaler if data type is float16
         for micro_step in range(gradient_accumulation_steps):
             if ddp:
+                
                 model.require_backward_grad_sync = micro_step == gradient_accumulation_steps
             with ctx:
                 logits = model(X, Y)
