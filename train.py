@@ -22,7 +22,7 @@ import time
 from contextlib import nullcontext
 from datetime import datetime
 from  functools import partial
-
+import wandb
 import torch
 from model import Transformer, ModelArgs
 from torch.distributed import destroy_process_group, init_process_group
@@ -261,7 +261,7 @@ local_iter_num = 0
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
 while True:
-    # determine and set the learning rate for this interation
+    # determine and set the learning rate for this interaction
     lr = get_lr(iter_num) if decay_lr else learning_rate
     for param_group in optimizer.param_groups:
         param_group["lr"] = lr
@@ -305,10 +305,50 @@ while True:
         # and using the GradScaler if data type is float16
         for micro_step in range(gradient_accumulation_steps):
             if ddp:
-                
-                model.require_backward_grad_sync = micro_step == gradient_accumulation_steps
+                # in DDP traning we only need to sync gradients at the last micro step
+                # the official way to do this is with model.no_sync() context manager.
+                # i really dislike that this bloats the code and forces us to repeat the
+                # looking at the source of that context manager , it just toggles this variable
+                # Disable gradient sync for all steps except the last one
+                model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)  # Note: there's actually a bug here
+            
             with ctx:
                 logits = model(X, Y)
                 loss = raw_model.last_loss
                 loss = loss / gradient_accumulation_steps
-                
+            # immediately async prefetch next batch while model is doing the forward pass on the GPU
+            X, Y = next(train_batch_iter)
+            # backward pass with gradient scaling if training in fp16
+            scaler.scale(loss).backward()
+        # clip the gradient
+        if grad_clip != 0.0:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        # step the optimizer and scaler if training in fp16
+        scaler.step(optimizer)
+        scaler.update()
+        # flush the gradients as soon as we can, no need for this memory anymore
+        optimizer.zero_grad(set_to_none=True)
+
+        # timing and logging 
+        t1 = time.time()
+        d1 = t1 = t0
+        t0 = t1
+
+    if iter_num % log_interval == 0 and master_process:
+        # get loss as float, scale up due to the divide above. note: this is a CPU-GPU sync point
+        lossf = loss.item() * gradient_accumulation_steps
+        if local_iter_num >= 5:  # let the training loop settle a bit
+            mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
+            running_mfu = mfu if running_mfu == -1.0 else 0.9 * running_mfu + 0.1 * mfu
+        print(
+            f"{iter_num} | loss {lossf:.4f} | lr {lr:e} | {dt*1000:.2f}ms | mfu {running_mfu*100:.2f}%"
+        )
+    iter_num += 1
+    local_iter_num += 1
+    # termination conditions
+    if iter_num > max_iters:
+        break
+
+if ddp:
+    destroy_process_group()
