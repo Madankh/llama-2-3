@@ -120,7 +120,7 @@ def train_vocab(vocab_size):
 
 
 def process_shard(args, vocab_size):
-    shard_id , shard =args
+    shard_id , shard =  args
     tokenizer_model = get_tokenizer_model_path(vocab_size)
     enc = Tokenizer(tokenizer_model)
 
