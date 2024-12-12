@@ -108,7 +108,6 @@ if ddp:
     master_process = ddp_rank == 0
     seed_offset = ddp_rank
     gradient_accumulation_steps //= ddp_world_size
-
 else:
     master_process = True
     seed_offset = 0
