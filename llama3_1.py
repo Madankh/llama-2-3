@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-
+import math
 
 class ModelArgs:
     block_size : int = 8192
@@ -27,6 +27,38 @@ def repeat_kv(x:torch.Tensor, n_rep:int)->torch.Tensor:
         .reshape(bs, slen, n_kv_heads * n_rep, head_dim)
 )
 
+def reshape_for_broadcast(freqs_cis:torch.Tensor, x:torch.Tensor):
+    ndim = x.ndim
+    assert 0 <= 1 < ndim
+    assert freqs_cis.shape == (x.shape[1], x.shape[-1])
+    shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
+    return freqs_cis.view(*shape)
+
+def apply_scaling(freqs:torch.Tensor):
+    # Values obtained from grid search
+    scale_factor = 8
+    low_freq_factor = 1
+    high_freq_factor = 4
+    old_context_len = 8192 # original llama3 length
+
+    low_freq_wavelen = old_context_len / low_freq_factor
+    high_freq_wavelen = old_context_len / high_freq_factor
+    new_freqs = []
+    for freq in freqs:
+        wavelen = 2 * math.pi / freq
+        if wavelen < high_freq_wavelen:
+            new_freqs.append(freq)
+        elif wavelen > low_freq_wavelen:
+            new_freqs.append(freq/scale_factor)
+        else:
+            assert low_freq_wavelen != high_freq_wavelen
+            smooth = (old_context_len / wavelen - low_freq_factor)/(
+                high_freq_factor - low_freq_factor
+            )
+            new_freqs.append((1 - smooth) * freq / scale_factor + smooth * freq)
+    return torch.tensor(new_freqs, dtype=freq.dtype, device=freq.device)
+
+
 
 class RMSNorm(nn.Module):
     def __init__(self, dim:int , eps:float):
@@ -38,5 +70,7 @@ class RMSNorm(nn.Module):
     def forward(self, x):
         output = self.norm(x.float()).type_as(x)
         return output * self.weight
+    
+
     
 
