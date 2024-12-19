@@ -71,6 +71,14 @@ class RMSNorm(nn.Module):
         output = self.norm(x.float()).type_as(x)
         return output * self.weight
     
+def percompute_theta_pos_freqs(head_dim:int, seq_len:int, device:str, theta:float=10000.0):
+    theta_numerator = torch.arange(0, head_dim, 2).float()
+    theta = 1.0 / (theta ** (theta_numerator / head_dim)).to(device)
+    m = torch.arange(seq_len, device=device)
+    freqs = torch.outer(m, theta)
+    freqs_complex = torch.polar(torch.ones_like(freqs), freqs)
+    return freqs_complex
+
 
     
 
