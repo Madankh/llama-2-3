@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import math
-
+from typing import Tuple, List, Optional
 class ModelArgs:
     block_size : int = 8192
     vocab_size : int = 128256
@@ -71,13 +71,26 @@ class RMSNorm(nn.Module):
         output = self.norm(x.float()).type_as(x)
         return output * self.weight
     
-def percompute_theta_pos_freqs(head_dim:int, seq_len:int, device:str, theta:float=10000.0):
-    theta_numerator = torch.arange(0, head_dim, 2).float()
-    theta = 1.0 / (theta ** (theta_numerator / head_dim)).to(device)
-    m = torch.arange(seq_len, device=device)
-    freqs = torch.outer(m, theta)
-    freqs_complex = torch.polar(torch.ones_like(freqs), freqs)
-    return freqs_complex
+def percompute_freqs_cis(dim:int, end:int, theta:float, use_scaled:bool=False):
+    freqs = 1.0/(theta ** torch.arange(0, dim, 2)[:(dim//2)].flaot())
+    t = torch.arange(end, device=freqs.device, dtype=torch.float32)
+    if use_scaled:
+        freqs = apply_scaling(freqs)
+    freqs = torch.outer(t, freqs)
+    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
+    return freqs_cis
+
+def apply_rotary_emb(xq:torch.Tensor,
+                     xk:torch.Tensor,
+                     freqs_cis:torch.Tensor)->Tuple[torch.Tensor, torch.Tensor]:
+    xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
+    xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
+    freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
+    xq_out = torch.view_as_real(xq_, *freqs_cis).flatten(3)
+    xk_out = torch.view_as_real(xk_, *freqs_cis).flatten(3)
+    return xq_out.type_as(xq), xk_out.type_as(xk)
+
+
 
 
     
