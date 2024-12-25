@@ -91,7 +91,25 @@ def apply_rotary_emb(xq:torch.Tensor,
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
 
+# LLaMa building blocks
+class CausalSelfAttention(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        assert config.n_embd % config.n_head == 0
+        self.n_head = config.n_head
+        self.n_kv_head = config.n_kv_head
+        self.n_rep = self.n_head // self.n_kv_head
+        self.hd = config.n_embd // config.n_head
+        self.use_kv = config.use_kv
+        self.flash = config.flash
 
+        self.c_attn = nn.Linear(config.n_embd, (config.n_head + 2 * config.n_kv_head) * self.hd, bias=False)
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
 
-    
-
+        # static KV cache - we could alternatively allocate it outside of the model just pass it in when needed
+        if self.use_kv:
+            self.cache_k = torch.zeros((config.max_gen_batch_size, config.block_size, self.n_kv_head, self.hd))
+            self.cache_v = torch.zeros((config.max_gen_batch_size, config.block_size, self.n_kv_head, self.hd))
+        
+    def forward(self, x, freqs_cis=None, start_pos=None, mask=None):
+        B, T, C = x.size()
