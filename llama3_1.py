@@ -3,6 +3,7 @@ import torch.nn as nn
 import math
 from typing import Tuple, List, Optional
 import torch.nn.functional as F
+from pathlib import Path
 class ModelArgs:
     block_size : int = 8192
     vocab_size : int = 128256
@@ -175,7 +176,7 @@ class Block(nn.Module):
         x = x + self.mlp(self.ln_2(x))
         return x
     
-@dataclass
+# @dataclass
 class LlamaConfig:
     version: str = "3.1"
     block_size: int = 8192
@@ -200,3 +201,187 @@ class LlamaConfig:
         assert self.n_kv_head <= self.n_head
         assert self.n_head % self.n_kv_head == 0
         assert self.n_embd % self.n_head == 0
+
+
+
+class LLaMa(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+
+        self.transformer = nn.ModuleDict(dict(
+            wte = nn.Embedding(config.vocab_size, config.n_embd),
+            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            ln_f = RMSNorm(config.n_embd, config.norm_eps),
+        ))
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+
+        # init all weights use a torch rng object to be very careful
+        self.init_rng = torch.Generator()
+        self.init_rng.manual_seed(42)
+
+        self.freqs_cis = percompute_freqs_cis(
+            config.n_embd // config.n_head,
+            config.block_size * 2
+            config.rope_theta, 
+            config.use_scaled_rope
+        )
+
+    def forward(self, idx, targets=None, return_logits=True, start_pos=0):
+        _, t = idx.size()
+        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
+
+        # forward the LLAMA model itself
+        x = self.transformer.wte(idx) # token embeddings of shape (B, t, n_embd)
+        freqs_cis = self.freqs_cis[start_pos:start_pos+t]
+        mask = torch.triu(torch.ones((t, t), device=next(self.parameters()).device, dtype=torch.bool), diagonal=1)
+
+        for i , block in enumerate(self.transformer.h):
+            x = block(x, freqs_cis, start_pos, mask)
+        x = self.transformer.ln_f(x)
+
+        if targets is not None:
+            logits = self.lm_head(x).float()
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+        else:
+            logits = self.lm_head(x[:,[-1],:]).float()
+            loss = None
+        if not return_logits:
+            logits = None
+        return logits, loss
+    
+    @staticmethod
+    def adapt_llama_state_dict_keys(checkpoint, config: LlamaConfig):
+        # Modify key names from Meta's LLaMA to our LLaMA
+        # our key names are derived from GPT-2's key names
+        checkpoint['transformer.wte.weight'] = checkpoint.pop('tok_embeddings.weight')
+
+        for i in range(config.n_layer):
+            for name in ['attention_norm', 'ffn_norm']:
+                old_key = f'layers.{i}.{name}.weight'  # e.g. layers.x.attention_norm.weight -> transformer.h.x.ln_1.weight
+                new_key = f'transformer.h.{i}.ln_{1 if name == "attention_norm" else 2}.weight'
+                checkpoint[new_key] = checkpoint.pop(old_key)
+
+        for i in range(config.n_layer):
+            for name in ['attention.wq', 'attention.wk', 'attention.wv']:
+                old_key = f'layers.{i}.{name}.weight'
+                new_key = f'transformer.h.{i}.attn.c_attn.weight'
+                if name == 'attention.wq':
+                    checkpoint[new_key] = checkpoint.pop(old_key)
+                else:  # merge 3 weights into transformer.h.x.attn.c_attn.weight
+                    checkpoint[new_key] = torch.cat((checkpoint[new_key], checkpoint.pop(old_key)), dim=0)
+            old_key = f'layers.{i}.attention.wo.weight'
+            new_key = f'transformer.h.{i}.attn.c_proj.weight'
+            checkpoint[new_key] = checkpoint.pop(old_key)
+
+        ffn_map = {'w1': 'c_fc2', 'w2': 'c_proj', 'w3': 'c_fc'}
+        for i in range(config.n_layer):
+            for name in ['feed_forward.w1', 'feed_forward.w2', 'feed_forward.w3']:
+                old_key = f'layers.{i}.{name}.weight'
+                new_key = f'transformer.h.{i}.mlp.{ffn_map[name.split(".")[-1]]}.weight'
+                checkpoint[new_key] = checkpoint.pop(old_key)
+
+        checkpoint['transformer.ln_f.weight'] = checkpoint.pop('norm.weight')
+        checkpoint['lm_head.weight'] = checkpoint.pop('output.weight')
+
+        return checkpoint
+
+    @staticmethod
+    def adapt_llama_state_dict_keys_hf(checkpoint, config: LlamaConfig):
+        # Modify key names from HuggingFace's LLaMA to our LLaMA
+        # our key names are derived from GPT-2's key names
+        checkpoint['transformer.wte.weight'] = checkpoint.pop('model.embed_tokens.weight')
+
+        # We need to unpermute K and V because HF script permuted the original Meta-LLaMA weights
+        # see: https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/convert_llama_weights_to_hf.py
+        def unpermute(w, n_heads, dim1, dim2):
+            return w.view(n_heads, 2, dim1 // n_heads // 2, dim2).transpose(1, 2).reshape(dim1, dim2)
+
+        for i in range(config.n_layer):
+            for name in ['input_layernorm', 'post_attention_layernorm']:
+                old_key = f'model.layers.{i}.{name}.weight'  # e.g. layers.x.attention_norm.weight -> transformer.h.x.ln_1.weight
+                new_key = f'transformer.h.{i}.ln_{1 if name == "input_layernorm" else 2}.weight'
+                checkpoint[new_key] = checkpoint.pop(old_key)
+
+        for i in range(config.n_layer):
+            for name in ['self_attn.q_proj', 'self_attn.k_proj', 'self_attn.v_proj']:
+                old_key = f'model.layers.{i}.{name}.weight'
+                new_key = f'transformer.h.{i}.attn.c_attn.weight'
+                if name == 'self_attn.q_proj':
+                    checkpoint[new_key] = unpermute(checkpoint.pop(old_key), config.n_head, config.n_embd, config.n_embd)
+                else:  # merge 3 weights into transformer.h.x.attn.c_attn.weight
+                    tensor = checkpoint.pop(old_key)
+                    if name == 'self_attn.k_proj':
+                        tensor = unpermute(tensor, config.n_kv_head, config.n_kv_head * (config.n_embd // config.n_head), config.n_embd)
+                    checkpoint[new_key] = torch.cat((checkpoint[new_key], tensor), dim=0)
+            old_key = f'model.layers.{i}.self_attn.o_proj.weight'
+            new_key = f'transformer.h.{i}.attn.c_proj.weight'
+            checkpoint[new_key] = checkpoint.pop(old_key)
+
+        ffn_map = {'gate_proj': 'c_fc2', 'down_proj': 'c_proj', 'up_proj': 'c_fc'}
+        for i in range(config.n_layer):
+            for name in ['gate_proj', 'down_proj', 'up_proj']:
+                old_key = f'model.layers.{i}.mlp.{name}.weight'
+                new_key = f'transformer.h.{i}.mlp.{ffn_map[name]}.weight'
+                checkpoint[new_key] = checkpoint.pop(old_key)
+
+        checkpoint['transformer.ln_f.weight'] = checkpoint.pop('model.norm.weight')
+
+        return checkpoint
+
+    @classmethod
+    def from_pretrained_llama3_hf(cls, model_id):
+        """Loads pretrained LLaMA model weights from HuggingFace"""
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        assert model_id == "meta-llama/Meta-Llama-3.1-8B", "Only the 8B-base model is supported for now"
+        model_args = LlamaConfig()
+
+        model = AutoModelForCausalLM.from_pretrained(model_id)
+        checkpoint = LLaMa.adapt_llama_state_dict_keys_hf(model.state_dict(), model_args)
+
+        original_default_type = torch.get_default_dtype()  # save the default type
+        torch.set_default_tensor_type(torch.cuda.BFloat16Tensor)  # much faster loading
+        model = LLaMa(model_args)
+        model.load_state_dict(checkpoint, strict=False)
+        torch.set_default_tensor_type(torch.tensor([], dtype=original_default_type, device="cpu").type())  # restore default type
+
+        tokenizer = AutoTokenizer.from_pretrained(model_id)
+        tokenizer.pad_id = 128004  # this is the pad token id for LLaMA 3.1 base, we need to set this explicitly as our generate func expects it
+        tokenizer.stop_tokens = [tokenizer.eos_token_id]
+        model.tokenizer = tokenizer
+        return model
+
+    @classmethod
+    def from_pretrained_llama3_meta(cls, ckpt_dir, tokenizer_path):
+        """Loads pretrained LLaMA model weights from a checkpoint directory"""
+        model_args = LlamaConfig()
+
+        ckpt_path = sorted(Path(ckpt_dir).glob("*.pth"))[0]
+        checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+        checkpoint = LLaMa.adapt_llama_state_dict_keys(checkpoint, model_args)
+
+        original_default_type = torch.get_default_dtype()  # save the default type
+        torch.set_default_tensor_type(torch.cuda.BFloat16Tensor)  # much faster loading
+        model = LLaMa(model_args)
+        model.load_state_dict(checkpoint, strict=False)
+        torch.set_default_tensor_type(torch.tensor([], dtype=original_default_type, device="cpu").type())  # restore default type
+
+        tokenizer = Tokenizer(model_path=tokenizer_path)
+        model.tokenizer = tokenizer
+        return model
+    
+
+    def configure_optimizers(self , weight_decay, learning_rate, betas, device_type, zero_stage):
+        # start wtih all of the candidate parameters
+        params_dict = {pn:p for pn , p in self.named_parameters()}
+        params_dict = {pn:p for pn, p in params_dict.items() if p.requires_grad}
+        decay_params = [p for n, p in params_dict.items() if p.dim() >=2]
+        non_decay_params = [p for n, p in params_dict.items() if p.dim()<=2]
+        optim_groups = [
+            {'params':decay_params, 'weight_decay':weight_decay},
+            {'params':non_decay_params, 'weight_decay':0.0}
+        ]
+        num_decay_params = sum(p.numer() for p in decay_params)
+        num_nodecay_params = sum(p.numer() for p in non_decay_params)
+
+    
