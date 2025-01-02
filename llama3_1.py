@@ -3,7 +3,12 @@ import torch.nn as nn
 import math
 from typing import Tuple, List, Optional
 import torch.nn.functional as F
+import os
 from pathlib import Path
+import inspect
+import glob
+import numpy as np
+from torch.distributed.optim import ZeroRedundancyOptimizer
 class ModelArgs:
     block_size : int = 8192
     vocab_size : int = 128256
@@ -169,7 +174,7 @@ class Block(nn.Module):
         super().__init__()
         self.ln1 = RMSNorm(config.n_embd, config.norm_eps)
         self.attn = CausalSelfAttention(config)
-        self.ln_2 = RMSNorm(config.n_enbdm config.norm_eps)
+        self.ln_2 = RMSNorm(config.n_enbd, config.norm_eps)
         self.mlp = MLP(config)
     def forword(self , x, freqs_cis=None, start_pos=None, mask=None):
         x = x + self.attn(self.ln1(x), freqs_cis, start_pos, mask)
@@ -222,7 +227,7 @@ class LLaMa(nn.Module):
 
         self.freqs_cis = percompute_freqs_cis(
             config.n_embd // config.n_head,
-            config.block_size * 2
+            config.block_size * 2,
             config.rope_theta, 
             config.use_scaled_rope
         )
@@ -371,17 +376,262 @@ class LLaMa(nn.Module):
         return model
     
 
-    def configure_optimizers(self , weight_decay, learning_rate, betas, device_type, zero_stage):
-        # start wtih all of the candidate parameters
-        params_dict = {pn:p for pn , p in self.named_parameters()}
-        params_dict = {pn:p for pn, p in params_dict.items() if p.requires_grad}
-        decay_params = [p for n, p in params_dict.items() if p.dim() >=2]
-        non_decay_params = [p for n, p in params_dict.items() if p.dim()<=2]
+    def configure_optimizers(self, weight_decay, learining_rate, betas, device_type, zero_stage):
+        params_dict = {pn:p for pn, p in self.parameters()}
+        params_dict = {pn:p for pn, p in params_dict.items() if p.require_grad()}
+
+        decay_params = [p for pn , p in params_dict.items() if p.dim() >=2]
+        non_decay_params = [p for pn, p in params_dict.items() if p.dim() <2]
+
         optim_groups = [
-            {'params':decay_params, 'weight_decay':weight_decay},
-            {'params':non_decay_params, 'weight_decay':0.0}
+           {"params":decay_params, "weight_decay":weight_decay},
+           {"params": non_decay_params, "weight_decay":0.0}
         ]
-        num_decay_params = sum(p.numer() for p in decay_params)
-        num_nodecay_params = sum(p.numer() for p in non_decay_params)
+
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and device_type == "cuda"
+        if zero_stage == 1:
+            print0("using zeroRedundancyOptimizer")
+            optimizer  = ZeroRedundancyOptimizer(**optim_groups[0], optimizer_class=torch.optim.AdamW,
+                                                 lr=learining_rate, betas=betas, fused=use_fused)
+            optimizer.add_param_group(optim_groups[1])
+        else:
+            print0("using regular AdamW")
+            optimizer = torch.optim.AdamW(optim_groups, lr=learining_rate, betas=betas, fused=use_fused)
+        return optimizer
+    @torch.inference_mode()
+    def generate(
+        self, 
+        promp_tokens:List[List[int]],
+        max_gen_len : int,
+        temperation : float = 0.6,
+        top_p:float = 0.9,
+        echo:bool = False
+    ) -> Tuple[List[List[int]], Optional[List[List[float]]]]:
+        bsz = len(promp_tokens)
 
     
+def print0(*args, **kwargs):
+    if int(os.environ.get("RANK", 0)) == 0:
+        print(*args, **kwargs)
+
+
+
+def _peek_data_shard(filename):
+    # Opens binary file to read header
+    with open(filename, "rb") as f:
+        # Reads first 256*4 bytes as int32 array
+        header = np.frombuffer(f.read(256 * 4), dtype=np.int32)
+    
+    # Checks magic number (file format identifier)
+    if header[0] != 20240801:
+        print("Error: magic number mismatch in the data .bin files")
+        exit(1)
+    
+    # Verifies version number is 7
+    assert header[1] == 7, "unsupported version"
+    
+    # Gets token count from header
+    ntok = header[2]
+    return ntok
+
+def _load_data_shard(filename):
+    # Opens binary file
+    with open(filename, "rb") as f:
+        # Reads header same as peek
+        header = np.frombuffer(f.read(256 * 4), dtype=np.int32)
+        assert header[0] == 20240801, "magic number mismatch"
+        assert header[1] == 7, "unsupported version"
+        ntok = header[2]
+        
+        # Reads all tokens as uint32 array
+        tokens = np.frombuffer(f.read(), dtype=np.uint32)
+    
+    # Verifies token count matches header
+    assert len(tokens) == ntok, "Token count mismatch"
+    return tokens
+
+class DistributedShardedDataLoader:
+    def __init__(self, filename_pattern, B, T, process_rank, num_processes):
+        # Stores process info and dimensions
+        self.process_rank = process_rank
+        self.num_processes = num_processes
+        self.B = B  # batch size
+        self.T = T  # sequence length
+        
+        # Gets all matching data files
+        self.files = sorted(glob.glob(filename_pattern))
+        assert len(self.files) > 0, "No matching files found"
+        
+        # Counts total tokens across all shards
+        ntok_total = 0
+        for fname in self.files:
+            shards_ntok = _peek_data_shard(fname)
+            # Verifies shard has enough tokens for distribution
+            assert shards_ntok >= num_processes * B * T + 1
+            ntok_total += shards_ntok
+        self.ntok_total = ntok_total
+        
+        # Initializes shard tracking
+        self.current_shard = None
+        self.reset()
+    
+    def reset(self):
+        # Resets to first shard if needed
+        if self.current_shard != 0:
+            self.current_shard = 0
+            self.tokens = _load_data_shard(self.files[self.current_shard])
+        # Sets position based on process rank
+        self.current_position = self.process_rank * self.B * self.T
+
+    def advance(self):
+        # Moves to next shard cyclically
+        self.current_shard = (self.current_shard + 1) % len(self.files)
+        # Resets position for new shard
+        self.current_position = self.process_rank * self.B * self.T
+        # Loads new shard data
+        self.tokens = _load_data_shard(self.files[self.current_shard])
+
+    def next_batch(self):
+        B = self.B
+        T = self.T
+        # Gets sequence of tokens for batch
+        buf = self.tokens[self.current_position: self.current_position + B * T + 1]
+        # Converts to PyTorch tensor
+        buf = torch.tensor(buf, dtype=torch.long)
+        # Creates input and target tensors
+        x = (buf[:-1]).view(B, T)
+        y = (buf[1:]).view(B, T)
+        
+        # Advances position by batch size times processes
+        self.current_position += B * T * self.num_processes
+        
+        # Moves to next shard if current exhausted
+        if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
+            self.advance()
+            
+        return x, y
+    
+# --------------------------------------------------------------------
+# Python -> C bridge utilities for saving params/grads/activations to .bin files
+def write_fp32(tensor, file):
+    t = tensor.detach().cpu().numpy().astype(np.float32)
+    b = t.tobytes()
+    file.write(b)
+
+def write_bf16(tensor, file):
+    t = tensor.detach().cpu().numpy().astype(np.bfloat16)
+    t = t.view(torch.int16)
+    b = t.numpy().tobytes()
+    file.write(b)
+
+def write_tensors(model_tensors, L, file, dtype):
+    # writes LLaMA 3 model's weights to a binary file
+    assert dtype in {"float32", "bfloat16"}
+    write_fun = write_fp32 if dtype == "float32" else write_bf16
+    write_fun(model_tensors["transformer.wte.weight"], file) # (V, C)
+    for i in range(L): # (L, C)
+        write_fun(model_tensors[f"transformer.h.{i}.ln_1.weight"], file)
+    for i in range(L): # (L, 3C, C)
+        write_fun(model_tensors[f"transformer.h.{i}.attn.c_attn.weight"], file)
+    for i in range(L): # (L, C, C)
+        write_fun(model_tensors[f"transformer.h.{i}.attn.c_proj.weight"], file)
+    for i in range(L): # (L, C)
+        write_fun(model_tensors[f"transformer.h.{i}.ln_2.weight"], file)
+    for i in range(L): # (L, 4C, C)
+        write_fun(model_tensors[f"transformer.h.{i}.mlp.c_fc.weight"], file)
+    for i in range(L): # (L, 4C, C)
+        write_fun(model_tensors[f"transformer.h.{i}.mlp.c_fc2.weight"], file)
+    for i in range(L): # (L, C, 4C)
+        write_fun(model_tensors[f"transformer.h.{i}.mlp.c_proj.weight"], file)
+    write_fun(model_tensors["transformer.ln_f.weight"], file) # (C, )
+    write_fun(model_tensors["lm_head.weight"], file) # (V, C)
+
+
+def write_model(model, filename, dtype):
+    # everything we need to instantiate the model
+    assert dtype in {"float32", "bfloat16"}
+    version = {
+        "float32":3, #  3: all tensors are fp32
+        "bfloat16":5, # 5: all tensors are bf16
+    }[dtype]
+
+    header = torch.zeros(256, dtype=torch.int32)
+    header[0] = 20240801
+    header[1] = version
+    header[2] = model.config.block_size
+    header[3] = model.config.vocab_size
+    header[4] = model.config.n_layer
+    header[5] = model.config.n_head
+    header[6] = model.config.n_kv_head
+    header[7] = model.config.n_embd
+    header[8] = model.config.ffn_dim_multiplier
+    header[9] = model.config.multiple_of
+    header[10] = model.config.norm_eps
+    header[11] = model.config.rope_theta
+    header[12] = model.config.use_scaled_rope
+    header[13] = model.config.max_gen_batch_size
+    header[14] = int(model.config.version.split('.')[0])
+    header[15] = int(model.config.version.split('.')[1])
+    # 2) the parameters follow the header
+    params = {name:params.cpu() for name, params in model.parameters()}
+    # now write to file
+    with open(filename, "wb") as file:
+        file.write(header.numpy().tobytes()) # header
+        write_tensors(params, model.config.n_layer, file, dtype) # params
+    print(f"wrote {filename}")
+    
+
+if __name__ == "__main__":
+    print0(f"Running pytorch {torch.version.__version__}")
+
+    # default settings will overfit a tiny batch of data
+    # and save model weights and debug state to disk on the first iteration
+    parser = arg.parse.ArgumentParser()
+    parser.add_argument("--use_hf", type=int, default=1, help="use HuggingFace (default) or use Meta's model")
+    parser.add_argument("--ckpt_dir", type=str, default=None, help="path to llama3 model checkpoint (needed if use_hf=0)")
+    parser.add_argument("--tokenizer_path", type=str, default=None, help="path to llama3 tokenizer (needed if use_hf=0)")
+    # file system input / output
+    parser.add_argument("--input_bin", type=str, default="dev/data/tinyshakespeare/tiny_shakespeare_val.bin", help="input .bin to train on")
+    parser.add_argument("--input_val_bin", type=str, default="", help="input .bin to eval validation loss on")
+    parser.add_argument("--output_dir", type=str, default="", help="output directory to which to write logs and checkpoints")
+    parser.add_argument("--model", type=str, default="meta-llama/Meta-Llama-3.1-8B", help="chose the llama model")
+    # token layout for each step of the optimization
+    parser.add_argument("--batch_size", type=int, default=4, help="batch size, in units of #batch dimensions")
+    parser.add_argument("--sequence_length", type=int, default=64, help="sequence length")
+    parser.add_argument("--total_batch_size", type=int, default=256, help="total desired batch size, in units of #tokens")
+    # workload (number of steps)
+    parser.add_argument("--num_iterations", type=int, default=10, help="number of iterations to run")
+    parser.add_argument("--inference_only", type=int, default=0, help="only run inference")
+    # optimization
+    parser.add_argument("--learning_rate", type=float, default=1e-5, help="learning rate warmup iterations")
+    parser.add_argument("--warmup_iters", type=int, default=0, help="learning rate warmup iterations")
+    parser.add_argument("--learning_rate_decay_frac", type=float, default=1.0, help="learning rate warmup iterations")
+    parser.add_argument("--weight_decay", type=float, default=0.0, help="weight decay")
+    parser.add_argument("--grad_clip", type=float, default=1.0, help="maximum gradient magnitude")
+    # evaluation
+    parser.add_argument("--val_loss_every", type=int, default=0, help="every how mant steps to evaluate val loss?")
+    parser.add_argument("--val_max_steps", type=int, default=20, help="how many batches of val to average?")
+    parser.add_argument("--sample_every", type=int, default=0, help="how often to sample from the model?")
+    # debugging
+    parser.add_argument("--overfit_single_batch", type=int, default=1, help="overfit just one batch of data")
+    # numerics
+    parser.add_argument("--tensorcores", type=int, default=0, help="use tensorcores")
+    # memory management
+    parser.add_argument("--device", type=str, default="", help="by default we autodetect, or set it here")
+    parser.add_argument("--compile", type=int, default=0, help="torch.compile the model")
+    parser.add_argument("--dtype", type=str, default="bfloat16", help="float32|float16|bfloat16")
+    parser.add_argument("--zero_stage", type=int, default=0, help="zero redundancy optimizer stage (0/1/2/3)")
+    # python -> C bridge
+    parser.add_argument("--write_tensors", type=int, default=0, help="write tensors to disk")
+    args = parser.args()
+
+    # args error checking and convenience variables
+    B, T = args.batch_size, args.sequence_length
+    assert 1 <= T <= 8192, "sequence length must be between 1 and 8192"
+    assert args.dtype in {"float32", "float16", "bfloat16"}
+    assert args.model in {"meta-llama/Meta-Llama-3.1-8B"}  # only 8B base model supported for no
+    
+    
+
+             
