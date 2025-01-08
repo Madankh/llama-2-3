@@ -9,6 +9,10 @@ import inspect
 import glob
 import numpy as np
 from torch.distributed.optim import ZeroRedundancyOptimizer
+import torch._inductor.config as config
+from torch.nn.parallel import DistributedDataParallel
+from torch.distributed import init_process_group, destroy_process_group
+
 class ModelArgs:
     block_size : int = 8192
     vocab_size : int = 128256
@@ -408,14 +412,265 @@ class LLaMa(nn.Module):
         top_p:float = 0.9,
         echo:bool = False
     ) -> Tuple[List[List[int]], Optional[List[List[float]]]]:
-        bsz = len(promp_tokens)
+        """
+        Generate text sequences based on provided prompts using the language generation model.
 
-    
+        Args:
+            prompt_tokens (List[List[int]]): List of tokenized prompts, where each prompt is represented as a list of integers.
+            max_gen_len (int): Maximum length of the generated text sequence.
+            temperature (float, optional): Temperature value for controlling randomness in sampling. Defaults to 0.6.
+            top_p (float, optional): Top-p probability threshold for nucleus sampling. Defaults to 0.9.
+            echo (bool, optional): Flag indicating whether to include prompt tokens in the generated output. Defaults to False.
+
+        Returns:
+            Tuple[List[List[int]], Optional[List[List[float]]]]: A tuple containing generated token sequences.
+
+        Note:
+            This method uses the provided prompts as a basis for generating text. It employs nucleus sampling to produce text with controlled randomness.
+
+        """
+        bsz = len(promp_tokens)
+        assert bsz <= self.config.max_gen_batch_size, f"Batch size {bsz} exceeds the maximum generation batch size {self.config.max_gen_batch_size}"
+        device = next(self.parameters()).device
+
+        min_prompt_len = min(len(p) for p in promp_tokens)
+        max_prompt_len = max(len(p) for p in promp_tokens)
+        assert max_prompt_len <= self.config.block_size, f"Prompt length {max_prompt_len} exceeds the maximum block size {self.config.block_size}"
+        total_len = min(self.config.block_size, max_prompt_len + max_gen_len)
+
+        pad_id = self.tokenizer.pad_id
+        tokens = torch.full((bsz, total_len), pad_id, dtype=torch.long, device=device)
+        for idx, t in enumerate(promp_tokens):
+            tokens[idx, :len(t)] = torch.tensor(t, dtype=torch.long, device=device)
+
+        prev_pos = 0
+        eos_reached = torch.tensor([False] * bsz, device=device)
+        input_text_mask = tokens != pad_id
+
+        if min_prompt_len == total_len:
+            logits , _ = self.forward(tokens, start_pos=prev_pos)
+        
+        stop_tokens = torch.tensor(list(self.tokenizer.stop_tokens), dtype=torch.long, device=device)
+
+        for cur_pos in range(min_prompt_len, total_len):
+            logits, _ = self.forward(tokens[:,prev_pos:cur_pos], start_pos=prev_pos)
+            if temperation > 0:
+                probs = torch.softmax(logits[:, -1] / temperation, dim=-1)
+                next_token = sample_top_p(probs, top_p)
+            else:
+                next_token = torch.argmax(logits[:, -1], dim=-1)
+            
+            next_token = next_token.reshape(-1)
+
+            # only replace token if prompt has already been generated
+            next_token = torch.where(input_text_mask[:, cur_pos], tokens[:, cur_pos], next_token)
+            tokens[:, cur_pos] = next_token
+            eos_reached |= ~input_text_mask[:, cur_pos] & torch.isin(next_token, stop_tokens)
+            prev_pos = cur_pos
+            if all(eos_reached):
+                break
+
+        out_tokens = []
+        for i, toks in enumerate(tokens.tolist()):
+            # cut to max gen len
+            start = 0 if echo else len(promp_tokens[i])
+            toks = toks[start : len(promp_tokens[i]) + max_gen_len]
+            # cut to after eos tok if any
+            for stop_token in self.tokenizer.stop_tokens:
+                try:
+                    eos_idx = toks.index(stop_token)
+                    toks = toks[:eos_idx]
+                except ValueError:
+                    pass
+            out_tokens.append(toks)
+        return out_tokens
+
+def sample_top_p(probs, p):
+    """
+    Perform top-p (nucleus) sampling on a probability distribution
+
+    """
+    probs_sort,  probs_idx = torch.sort(probs, dim=-1, descending=True)
+    probs_sum = torch.cumsum(probs_sort, dim=-1)
+    mask = probs_sum - probs_sort > p
+    probs_sort[mask] = 0.0
+    probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
+    next_token = torch.multinomial(probs_sort, num_samples=1)
+    next_token = torch.gather(probs_idx, -1, next_token)
+    return next_token
+
+
 def print0(*args, **kwargs):
     if int(os.environ.get("RANK", 0)) == 0:
         print(*args, **kwargs)
 
 
+# -----------------------------------------------------------------------------
+# Llama 3.1 Tokenizer
+
+# The tiktoken tokenizer can handle <=400k chars without
+# pyo3_runtime.PanicException.
+TIKTOKEN_MAX_ENCODE_CHARS = 400_000
+
+# https://github.com/openai/tiktoken/issues/195
+# Here we iterate over subsequences and split if we exceed the limit
+# of max consecutive non-whitespace or whitespace characters.
+MAX_NO_WHITESPACES_CHARS = 25_000
+
+
+class Tokenizer:
+    """
+    Tokenizing and encoding/decoding text using the Tiktoken tokenizer.
+    """
+
+    special_tokens: Dict[str, int]
+
+    num_reserved_special_tokens = 256
+
+    pat_str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"  # noqa: E501
+
+    def __init__(self, model_path: str):
+        """
+        Initializes the Tokenizer with a Tiktoken model.
+
+        Args:
+            model_path (str): The path to the Tiktoken model file.
+        """
+        assert os.path.isfile(model_path), model_path
+
+        mergeable_ranks = load_tiktoken_bpe(model_path)
+        num_base_tokens = len(mergeable_ranks)
+        special_tokens = [
+            "<|begin_of_text|>",
+            "<|end_of_text|>",
+            "<|reserved_special_token_0|>",
+            "<|reserved_special_token_1|>",
+            "<|finetune_right_pad_id|>",
+            "<|step_id|>",
+            "<|start_header_id|>",
+            "<|end_header_id|>",
+            "<|eom_id|>",  # end of message
+            "<|eot_id|>",  # end of turn
+            "<|python_tag|>",
+        ]
+        reserved_tokens = [
+            f"<|reserved_special_token_{2 + i}|>"
+            for i in range(self.num_reserved_special_tokens - len(special_tokens))
+        ]
+        special_tokens = special_tokens + reserved_tokens
+
+        self.special_tokens = {
+            token: num_base_tokens + i for i, token in enumerate(special_tokens)
+        }
+        self.model = tiktoken.Encoding(
+            name=Path(model_path).name,
+            pat_str=self.pat_str,
+            mergeable_ranks=mergeable_ranks,
+            special_tokens=self.special_tokens,
+        )
+
+        self.n_words: int = num_base_tokens + len(special_tokens)
+        # BOS / EOS token IDs
+        self.bos_id: int = self.special_tokens["<|begin_of_text|>"]
+        self.eos_id: int = self.special_tokens["<|end_of_text|>"]
+        self.eot_id: int = self.special_tokens["<|eot_id|>"]
+        self.eom_id: int = self.special_tokens["<|eom_id|>"]
+        self.python_tag_id = self.special_tokens["<|python_tag|>"]
+        self.pad_id: int = self.special_tokens["<|finetune_right_pad_id|>"]
+        # hardcoded stop tokens for the base model
+        self.stop_tokens = [
+            self.special_tokens["<|begin_of_text|>"],
+            self.special_tokens["<|end_of_text|>"],
+        ]
+
+    def encode(
+        self,
+        s: str,
+        *,
+        bos: bool,
+        eos: bool,
+        allowed_special: Optional[Union[Literal["all"], AbstractSet[str]]] = None,
+        disallowed_special: Union[Literal["all"], Collection[str]] = (),
+    ) -> List[int]:
+        """
+        Encodes a string into a list of token IDs.
+
+        Args:
+            s (str): The input string to be encoded.
+            bos (bool): Whether to prepend the beginning-of-sequence token.
+            eos (bool): Whether to append the end-of-sequence token.
+            allowed_tokens ("all"|set[str]): allowed special tokens in string
+            disallowed_tokens ("all"|set[str]): special tokens that raise an error when in string
+
+        Returns:
+            list[int]: A list of token IDs.
+
+        By default, setting disallowed_special=() encodes a string by ignoring
+        special tokens. Specifically:
+        - Setting `disallowed_special` to () will cause all text corresponding
+          to special tokens to be encoded as natural text (insteading of raising
+          an error).
+        - Setting `allowed_special` to "all" will treat all text corresponding
+          to special tokens to be encoded as special tokens.
+        """
+        if allowed_special is None:
+            allowed_special = set()
+        assert type(s) is str
+
+        substrs = (
+            substr
+            for i in range(0, len(s), TIKTOKEN_MAX_ENCODE_CHARS)
+            for substr in self._split_whitespaces_or_nonwhitespaces(
+                s[i : i + TIKTOKEN_MAX_ENCODE_CHARS], MAX_NO_WHITESPACES_CHARS
+            )
+        )
+        t: List[int] = []
+        for substr in substrs:
+            t.extend(
+                self.model.encode(
+                    substr,
+                    allowed_special=allowed_special,
+                    disallowed_special=disallowed_special,
+                )
+            )
+        if bos:
+            t.insert(0, self.bos_id)
+        if eos:
+            t.append(self.eos_id)
+        return t
+
+    def decode(self, t: Sequence[int]) -> str:
+        # Typecast is safe here. Tiktoken doesn't do anything list-related with the sequence.
+        return self.model.decode(cast(List[int], t))
+
+    @staticmethod
+    def _split_whitespaces_or_nonwhitespaces(
+        s: str, max_consecutive_slice_len: int
+    ) -> Iterator[str]:
+        """
+        Splits the string `s` so that each substring contains no more than `max_consecutive_slice_len`
+        consecutive whitespaces or consecutive non-whitespaces.
+        """
+        current_slice_len = 0
+        current_slice_is_space = s[0].isspace() if len(s) > 0 else False
+        slice_start = 0
+
+        for i in range(len(s)):
+            is_now_space = s[i].isspace()
+
+            if current_slice_is_space ^ is_now_space:
+                current_slice_len = 1
+                current_slice_is_space = is_now_space
+            else:
+                current_slice_len += 1
+                if current_slice_len > max_consecutive_slice_len:
+                    yield s[slice_start:i]
+                    slice_start = i
+                    current_slice_len = 1
+        yield s[slice_start:]
+
+# -----------------------------------------------------------------------------
+# mY Own simple Distributed Data Loader
 
 def _peek_data_shard(filename):
     # Opens binary file to read header
@@ -632,6 +887,95 @@ if __name__ == "__main__":
     assert args.dtype in {"float32", "float16", "bfloat16"}
     assert args.model in {"meta-llama/Meta-Llama-3.1-8B"}  # only 8B base model supported for no
     
-    
+    # create the logging directory if it does not exist
+    logfile = None
+    if args.output_dir:
+        os.makedirs(args.output_dir, exist_ok=True)
+        logfile = os.path.join(args.output_dir, "main.log")
+        # create the log file "main.log" inside it and wipe it clean
+        with open(logfile, "w") as f:
+            pass
 
-             
+
+    # set up DDP (distributed data parallel). torchrun sets this env variable
+    ddp = int(os.environ.get('RANK', -1)) != -1 # is this ddp run
+    if ddp:
+        # use of DDP atm demands cuda we set the device appropriately according to rank
+        assert torch.cuda.is_available(), "for noowo i think we need cuda for ddp"
+        init_process_group(backend='nccl')
+        ddp_rank = int(os.environ['RANK'])
+        ddp_local_rank = int(os.environ['LOCAL_RANK'])
+        ddp_world_size = int(os.environ['WORLD_SIZE'])
+        device = f'cuda:{ddp_local_rank}'
+        torch.cuda.set_device(device)
+        master_process = ddp_rank == 0 # this process will do logging , checkpointing etc.
+        seed_offset = 0 # each process gets the exact same seed
+        zero_stage = args.zero_stage
+    else:
+        ddp_rank = 0
+        ddp_local_rank = 0
+        zero_stage = 0
+        ddp_world_size = 1
+        master_process = True
+        seed_offset = 0
+
+        if args.device:
+            device = args.device
+        else:
+            # attemt to autodetect the device
+            device = 'cpu'
+            if torch.cuda.is_available():
+                device = "cuda"
+            elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                device = "mps"
+    device_type = 'cuda' if 'cuda' is device else 'cpu'
+    assert device_type in {"cuda"}, "GPU required to run LLAMA 3"
+    print(f"using device : {device}")
+
+    # calculate gradient accumulation from the desired total batch size and the current run configuration
+    token_per_fwdbwd = B * T * ddp_world_size
+    assert args.total_batch_size % token_per_fwdbwd == 0
+    grad_accum_steps = args.total_batch_size // token_per_fwdbwd
+    print0(f"total desired batch size: {args.total_batch_size}")
+    print0(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
+
+    # set up a context manager following the desired dtype and device
+    ptdtype = {'float32':torch.float32, 'bfload16':torch.bfloat16, 'float16':torch.float16}[args.dtype]
+    ctx = torch.amp.autocast(device_type=device_type, dtype=ptdtype) if (device_type == "cuda") else nullcontext()
+    #rng / reproducibility
+    torch.manual_seed(42)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(42)
+    
+    # set the torch precision mode to use TensorFloat32 (TF32) for matmuls
+    # docs https://pytorch.org/docs/stable/generated/torch.set_float32_matmul_precision.html
+    if args.tensorcores:
+        torch.set_float32_matmul_precision('high')
+    
+    # init the model
+    if args.use_hf:
+        model = LLaMa.from_pretrained_llama3_hf(args.model)
+    else:  # use Meta's checkpoint
+        assert args.ckpt_dir is not None and os.path.exists(args.ckpt_dir), f"llama3 ckpt dir {args.ckpt_dir} does not exist"
+        assert args.tokenizer_path is not None and os.path.exists(args.tokenizer_path), f"llama3 tokenizer path {args.tokenizer_path} does not exist"
+        model = LLaMa.from_pretrained_llama3_meta(args.ckpt_dir, args.tokenizer_path)
+
+    model.train()
+    if args.compile:
+        if hasattr(config, "coordidnate_descent_tuning"):
+            config.coordinate_descent_tuning = True
+        print0("Compiling the model..")
+        model = torch.compile(model)
+
+    # Our own version of simple DistrubutedDataloader
+    # # load tokens
+    train_loader = DistributedShardedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
+    val_loader = None
+    if args.input_val_bin:
+        val_loader = DistributedDataParallel(args.input_val_bin, B, T, ddp_rank, ddp_world_size)
+    # PyTorch -> C bridge: save some weights and state for C to load later as reference
+    # 
+    # do one forward pass to genereate ground truth for our C tests
+    #     
+
+
