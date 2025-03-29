@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import math
-from typing import Tuple, List, Optional
+from typing import Tuple,Dict,Union, List, Optional , Literal, AbstractSet, Collection, Sequence, Iterator
 import torch.nn.functional as F
 import os
 from pathlib import Path
@@ -14,6 +14,11 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 import torch.distributed as dist
 import time
+import argparse
+# Create an ArgumentParser object
+parser = argparse.ArgumentParser()
+# Parse the arguments
+args = parser.parse_args()
 
 class ModelArgs:
     block_size : int = 8192
@@ -70,8 +75,6 @@ def apply_scaling(freqs:torch.Tensor):
             )
             new_freqs.append((1 - smooth) * freq / scale_factor + smooth * freq)
     return torch.tensor(new_freqs, dtype=freq.dtype, device=freq.device)
-
-
 
 class RMSNorm(nn.Module):
     def __init__(self, dim:int , eps:float):
@@ -867,7 +870,8 @@ if __name__ == "__main__":
 
     # default settings will overfit a tiny batch of data
     # and save model weights and debug state to disk on the first iteration
-    parser = args.parse.ArgumentParser()
+    # args = parser.parse_args()
+    parser = argparse.ArgumentParser()
     parser.add_argument("--use_hf", type=int, default=1, help="use HuggingFace (default) or use Meta's model")
     parser.add_argument("--ckpt_dir", type=str, default=None, help="path to llama3 model checkpoint (needed if use_hf=0)")
     parser.add_argument("--tokenizer_path", type=str, default=None, help="path to llama3 tokenizer (needed if use_hf=0)")
@@ -904,7 +908,8 @@ if __name__ == "__main__":
     parser.add_argument("--zero_stage", type=int, default=0, help="zero redundancy optimizer stage (0/1/2/3)")
     # python -> C bridge
     parser.add_argument("--write_tensors", type=int, default=0, help="write tensors to disk")
-    args = parser.args()
+    # args = parser.args()
+    args = parser.parse_args()
 
     # args error checking and convenience variables
     B, T = args.batch_size, args.sequence_length
@@ -953,7 +958,7 @@ if __name__ == "__main__":
                 device = "cuda"
             elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
                 device = "mps"
-    device_type = 'cuda' if 'cuda' is device else 'cpu'
+    device_type = 'cuda' if device == 'cuda' else 'cpu'
     assert device_type in {"cuda"}, "GPU required to run LLAMA 3"
     print(f"using device : {device}")
 
