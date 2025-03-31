@@ -17,7 +17,7 @@ model = FastLanguageModel.get_peft_model(
     r = lora_rank,
     target_modules = ["q_proj", "k_proj", "v_proj", "o_proj",
                       "gate_proj", "up_proj", "down_proj"
-                      ],
+    ],
     lora_alpha = 16,
     use_gradient_checkpointing = "unsloth",
     random_state=3407
