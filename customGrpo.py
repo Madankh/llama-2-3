@@ -124,16 +124,164 @@ class GRPO:
     #     return loss.mean()
 
     def sample_batch(self):
+        # Check if running in distributed mode - if so, use specialized method for distributed processing
         if self.distributed:
             return self.distributed_sample_batch()
+        
+        # Initialize empty lists for storing formatted input texts and original samples
         inputs_texts = []
         samples = []
-        for _ in  range(self.batch_size):
+        
+        # Loop to collect batch_size number of samples from the data loader
+        for _ in range(self.batch_size):  # Note: Typo, should be self.batch_size
+            # Get the next item from the data loader iterator
             item = next(self.data_loader_iter)
+            
+            # Store the complete item (contains prompt and likely other metadata) in samples list
             samples.append(item)
+            
+            # Extract just the prompt field from the item
             prompt = item["prompt"]
+            
+            # Format the prompt using the tokenizer's chat template (adds system/user markers)
+            # tokenize=False means we get back text, not tokens yet
             formatted = self.tokenizer.apply_chat_template(prompt, tokenize=False)
+            
+            # Add the formatted prompt to our collection
             inputs_texts.append(formatted)
+        
+        # Convert all formatted texts to token IDs with padding to make them uniform length
+        # return_tensors="pt" ensures we get PyTorch tensors back
         encoded = self.tokenizer(inputs_texts, padding=True, return_tensors="pt")
-        input_ids = encoded['input_ids']
-        attention_mask = encoded['attention_mask']
+        
+        # Extract the token IDs and attention mask from the encoded result
+        input_ids = encoded["input_ids"]
+        attention_mask = encoded["attention_mask"]
+        
+        # Store the length of the prompts - we'll need this to separate prompt from generation later
+        prompt_length = input_ids.shape[1]
+        
+        # Repeat each input group_size times to generate multiple variations per prompt
+        input_ids = torch.repeat_interleave(input_ids, self.group_size, dim=0)
+        
+        # Duplicate the samples list to match the repeated inputs
+        # Note: Typo here, should be self.group_size not self.group*size
+        samples = [sample for * in range(self.group*size) for sample in samples]
+        
+        # Start timing the generation process
+        start_time = time.time()
+        
+        # Set maximum number of new tokens to generate
+        max_new_tokens = 512
+        
+        # Generate text completions using the model
+        outputs = self.model.generate(
+            # Move input_ids to the target device (CPU/GPU)
+            input_ids.to(self.device),
+            # Generate up to 512 new tokens (after the prompt)
+            max_new_tokens=max_new_tokens,
+            # Use temperature of 0.9 for some randomness in generation
+            temperature=0.9,
+            # Note: Commented out parameters below show other possible settings
+            # min_new_tokens=512,
+            # repetition_penalty=1.1,
+        )
+        
+        # Stop timing and report generation time
+        end_time = time.time()
+        print(f"Time for generation: {end_time - start_time} seconds")
+        
+        # Convert token IDs back to text (keeping special tokens for complete output)
+        decoded_outputs = self.tokenizer.batch_decode(outputs, skip_special_tokens=False)
+        
+        # Calculate reward scores for each generated output
+        rewards = self.compute_rewards(samples, decoded_outputs)
+        
+        # Create a mask tensor of the same shape as outputs, initially all False/0
+        loss_mask = torch.zeros(outputs.shape, dtype=torch.bool)
+        
+        # Extract just the generated part (after the prompt)
+        gen_tokens = outputs[:, prompt_length:]
+        
+        # Create a mask that's True for all generated tokens except padding tokens
+        valid_gen_mask = gen_tokens != self.tokenizer.pad_token_id
+        
+        # Update the loss mask to include only valid generated tokens
+        loss_mask[:, prompt_length:] = valid_gen_mask
+        
+        # Return three key elements for training:
+        # 1. Full token outputs (prompt + generation)
+        # 2. Rewards tensor (converted to floating point with appropriate dtype)
+        # 3. Loss mask shifted by one position (for next-token prediction)
+        return outputs, torch.tensor(rewards, dtype=self.dtype).float(), loss_mask[:, 1:]
+    
+    def compute_rewards(self, samples, responces)->list:
+        rewards = [[[] for _ in range(self.batch_size)] for _ in range(len(self.reward_functions))]
+
+        for idx, (sample, resp) in enumerate(zip(samples, responces)):
+            reward = 0
+            for func_idx, func in enumerate(self.reward_functions):
+                reward += func(sample, resp)
+                rewards[func_idx][idx % self.batch_size].append(reward)
+            rewards = torch.tensor(rewards, dtype=self.dtype).to(self.device)
+
+            for func_idx, func in enumerate(self.reward_functions):
+                rwds = rewards[func_idx].mean(dim=-1)
+                for r in rwds:
+                    self.metrics[f"reward_ {func.__name__}"].append(r.item())
+            
+            prompt_lengths = [[] for _ in range(self.batch_size)]
+            for idx, sample in enumerate(samples):
+                prompt_lengths[idx % self.batch_size].append(len(sample["prompt"]))
+            
+            for idx, pl in enumerate(prompt_lengths):
+                self.metrics[f"prompt_length"].append(sum(pl)/len(pl))
+            
+            return rewards.sum(dim=0)
+        
+    def log_metrics(self):
+        if self.log_wandb:
+            idx = self.metrics["idx"][-1]-1
+            metrics = {}
+            for k, v in self.metrics.items():
+                metrics[f"train/{k}"] = v[idx] if len(v) >= idx else v[-1]
+            wandb.log(metrics)
+        
+    def train(self, epochs=1, max_iterations=1000):
+        idx = 0
+        start_time= time.perf_counter()
+        while idx < max_iterations:
+            x_batch_inputs , rewards , loss_mask = self.sample_batch()
+            torch.cuda.empty_cache()
+            
+            # Reshape batch into [Batch_size, group_size, seq_len]
+            # This separates the orignal prompts from their multiple variation
+            batch_inputs = x_batch_inputs.reshape(self.batch_size, self.group_size, *x_batch_inputs.shape[1:])
+            loss_mask = loss_mask.reshape(self.batch_size, self.group_size, *loss_mask.shape[1:]) 
+
+            # Free up more gpu memory
+            torch.cuda.empty_cache()
+
+            # Move data to cpu to save gpu memory
+            batch_inputs = batch_inputs.cpu()
+
+            rewards = rewards.cpu()
+            loss_mask = loss_mask.cpu()  
+
+            # Free up gpu memory again
+            torch.cuda.empty_cache()
+
+            # Initialize list to store  the old policy log probabilities
+            pi_old = []
+
+            
+
+
+
+        
+        
+
+        
+
+
+
