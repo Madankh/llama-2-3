@@ -264,7 +264,6 @@ class GRPO:
 
             # Move data to cpu to save gpu memory
             batch_inputs = batch_inputs.cpu()
-
             rewards = rewards.cpu()
             loss_mask = loss_mask.cpu()  
 
@@ -274,7 +273,44 @@ class GRPO:
             # Initialize list to store  the old policy log probabilities
             pi_old = []
 
-            
+            for _, (b_inputs) in enumerate(batch_inputs):
+                # Disable gradient calculation since we're just evaluating the old policy
+                with torch.no_grad():
+                    b_old_policy_log_probs = self.get_per_token_logs(self.model, b_inputs.to(self.device)).cpu()
+                    # Free GPU memory
+                    torch.cuda.empty_cache()
+
+                    # Stoore these loog probabilites
+                    pi_old.append(b_old_policy_log_probs)
+                # Process each batch item individually
+                for _, (b_inputs, b_old_policy_log_probs, b_reward, b_loss_mask) in enumerate(zip(batch_inputs, pi_old, rewards, loss_mask)):
+                    idx+=1
+
+                    # Move rewards to the device (GPU)
+                    reward = b_reward.to(self.device)
+
+                    # Calculaate mean and std of rewards for normalization
+                    mean_rewards = rewards.mean(dim=-1).unsqueeze(-1)
+                    std_rewards = reward.std(dim=-1).unsqueeze(-1)
+
+                    # Further split the groups into micro-groups to handle gpu memory constraints
+                    # This is like micro-batching - processing smaller chunks at a time
+                    g_inputs = b_inputs.reshape(b_inputs.shape[0]//self.micro_group_size, self.micro_group_size, *b_inputs.shape[1:]).cpu()
+                    g_old_policy_log_prob = b_old_policy_log_probs.reshape(b_inputs.shape[0]//self.micro_group_size, self.micro_group_size, *b_old_policy_log_probs.shape[1:])
+                    g_reward = b_reward.reshape(b_inputs.shape[0]//self.micro_group_size, self.micro_group_size, *b_reward.shape[1:]).cpu()
+                    g_loss_mask = b_loss_mask.reshape(b_inputs.shape[0]//self.micro_group_size, self.micro_group_size, *b_loss_mask.shape[1:]).cpu()
+                    group_losses = []
+
+                    
+
+
+
+
+
+
+
+
+
 
 
 
