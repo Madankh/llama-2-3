@@ -37,7 +37,7 @@ splits = text_splitter.split_documents(blog_docs)
 # Index
 cohere_embeddings = CohereEmbeddings(
     model="embed-english-light-v3.0",
-    cohere_api_key="D98frCXLayLP85D3mFPmM1EbRTOMYwwArnyuPUiS",
+    cohere_api_key="",
      user_agent="my-app")
 
 
@@ -70,7 +70,7 @@ generate_queries = (
     | ChatDeepSeek(model="deepseek-chat",
                    temperature=0,
                    max_tokens=512,
-                   api_key="sk-8252b811cc0241088e75623ffd779fb0"
+                   api_key="your key here"
                    ) 
     | StrOutputParser() 
     | (lambda x: x.split("\n"))

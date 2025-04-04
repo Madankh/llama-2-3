@@ -4,3 +4,5 @@ repeat1.py
 Medicalfinetune.py
 inference.py
 experiments
+.env
+RAG_BASIC_TO_ADVANCE/

@@ -27,7 +27,7 @@ from langchain_cohere import CohereEmbeddings
 
 cohere_embeddings = CohereEmbeddings(
     model="embed-english-light-v3.0",
-    cohere_api_key="D98frCXLayLP85D3mFPmM1EbRTOMYwwArnyuPUiS",
+    cohere_api_key="Key here",
      user_agent="my-app")
 
 vectorstore = Chroma.from_documents(documents=splits,
