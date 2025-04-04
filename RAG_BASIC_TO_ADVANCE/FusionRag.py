@@ -119,7 +119,7 @@ llm = ChatDeepSeek(
     model="deepseek-chat",
     temperature=0, 
     max_tokens=512,
-    api_key="sk-8252b811cc0241088e75623ffd779fb0"
+    api_key="your key here"
 )
 
 final_rag_chain = (

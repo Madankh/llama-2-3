@@ -11,7 +11,7 @@ from pymongo import MongoClient
 from langchain.load import dumps, loads
 
 # Replace with your MongoDB connection string
-mongodb_conn_string = "mongodb+srv://Motionfog:Dropleton123@cluster0.xvptlon.mongodb.net/test"
+mongodb_conn_string = "your mongodb connection string here"
 
 # Create a MongoDB client
 client = MongoClient(mongodb_conn_string)
