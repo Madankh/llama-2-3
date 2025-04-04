@@ -22,7 +22,9 @@ docs = loader.load()
 text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
 splits = text_splitter.split_documents(docs)
 
-from langchain_community.embeddings import CohereEmbeddings
+# from langchain_community.embeddings import CohereEmbeddings
+from langchain_cohere import CohereEmbeddings
+
 cohere_embeddings = CohereEmbeddings(
     model="embed-english-light-v3.0",
     cohere_api_key="D98frCXLayLP85D3mFPmM1EbRTOMYwwArnyuPUiS",
@@ -117,9 +119,6 @@ vectorstore = Chroma.from_documents(documents=splits,
                                     embedding=cohere_embeddings)
 
 retriever = vectorstore.as_retriever()
-
-
-
 
 
 docs = retriever.get_relevant_documents("What is Task Decomposition?")

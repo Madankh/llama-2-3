@@ -38,7 +38,7 @@ class GRPO:
         self.beta = beta
         self.epsilon = epsilon
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=weight_decay)
-        assert reward_functions if not None, "Must pass reward_functions"
+        # assert reward_functions if not None, "Must pass reward_functions"
         self.reward_functions:list = reward_functions
         self.using_lora = True if self.ref_model is None else False
         if self.using_lora:
@@ -91,38 +91,6 @@ class GRPO:
         return loss.mean()
     
 
-    # def compute_loss(self, inputs, old_policy_log_probs, reward, mean_rewards, std_rewards, loss_mask) -> Tensor:
-    #     policy_log_probs = self.get_per_token_logps(self.model, inputs)
-        
-    #     with (
-    #         self.ref_model.disable_adapter()
-    #         if self.using_lora  
-    #         else contextlib.nullcontext()
-    #     ):
-    #         ref_policy_log_probs = self.get_per_token_logps(self.ref_model, inputs)
-
-
-    #     # advantage calculation
-    #     advantage: Tensor = (reward - mean_rewards) / (std_rewards + 1e-6)
-    #     advantage = advantage.reshape(-1, 1)
-
-    #     # kl divergence calculation
-    #     log_ratios = ref_policy_log_probs - policy_log_probs
-    #     kld = torch.exp(log_ratios) - log_ratios - 1
-
-    #     policy_ratio = torch.exp(policy_log_probs-old_policy_log_probs.detach())
-
-    #     loss1 = policy_ratio*advantage
-    #     loss2 = torch.clamp(policy_ratio, 1 - self.epsilon, 1 + self.epsilon) * advantage
-    #     loss = -torch.min(loss1, loss2)
-    #     loss = (loss * loss_mask).sum(dim=-1)/ (loss_mask.sum(dim=-1) + 1e-6)
-    #     kld = (kld * loss_mask).sum(dim=-1)/ (loss_mask.sum(dim=-1) + 1e-6)
-    #     loss += kld * self.beta
-    #     if self.log_wandb:
-    #         for _kd in kld:
-    #             self.metrics["kld"].append(_kd.mean().item())
-    #     return loss.mean()
-
     def sample_batch(self):
         # Check if running in distributed mode - if so, use specialized method for distributed processing
         if self.distributed:
@@ -166,7 +134,7 @@ class GRPO:
         
         # Duplicate the samples list to match the repeated inputs
         # Note: Typo here, should be self.group_size not self.group*size
-        samples = [sample for * in range(self.group*size) for sample in samples]
+        samples = [sample for _ in range(self.group_size) for sample in samples]
         
         # Start timing the generation process
         start_time = time.time()
@@ -301,9 +269,38 @@ class GRPO:
                     g_loss_mask = b_loss_mask.reshape(b_inputs.shape[0]//self.micro_group_size, self.micro_group_size, *b_loss_mask.shape[1:]).cpu()
                     group_losses = []
 
-                    
+                    for inputs, old_policy_log_probs, reward, loss_mask in zip(g_inputs, g_old_policy_log_prob, g_reward, g_loss_mask):
+                        inputs = inputs.to(self.device)
+                        old_policy_log_probs = old_policy_log_probs.to(self.device)
+                        reward = reward.to(self.device)
+                        loss_mask = loss_mask.to(self.device)
 
+                        loss = self.compute_loss(inputs,
+                            old_policy_log_probs,
+                            reward,
+                            mean_rewards,
+                            std_rewards,
+                            loss_mask
+                        )
+                        group_losses.append(loss.item())
+                        loss.backward()
+                        torch.cuda.empty_cache()
 
+                    self.optimizer.step()
+                    self.optimizer.zero_grad()
+
+                    if self.log_wandb:
+                        self.metrics["idx"].append(idx)
+                        self.metrics["total_reward"].append(reward.mean().item())
+                        self.metrics["loss"].append(sum(group_losses)/len(group_losses))
+                    torch.cuda.empty_cache()
+
+                print(f"iter {idx} >>> reward : {reward.mean()}")
+                print(f"Total time : {str(datetime.timedelta(seconds=int(time.perf_counter() - start_time)))}")
+                self.log_metrics()
+
+                                           
+                
 
 
 
