@@ -5,40 +5,35 @@ import torch
 from rich import print
 import math
 from customGrpo import GRPO
+import re
 
 SYSTEM_PROMPT = "Respond in following format : <thinking>{step by step reasoning}</thinking><answer>{number}</answer>"
 
-# def prepare_dataset(dataset)->Dataset:
-#     extract_hash_answer = (
-#         lambda text : text.split("###")[1].strip() if "###" in text else None
-#     )
-    
-#     def process_example(example:dict):
-#         answer = extract_hash_answer(example["answer"])
-#         if answer is None:
-#             return None
-        
-#         return {
-#             "prompt":[
-#                 {"role":"system",
-#                  "content":SYSTEM_PROMPT},
-#                  {"role":"user",
-#                   "content":example["quesion"]},
-#             ],
-#             "answer":answer
-#         }
-    
-#     dataset = dataset.map(
-#         process_example,
-#         remove_columns = [
-#             col for col in dataset.column_names if col not in ["prompt", "answer"]
-#         ],
-#     )
-#     dataset = dataset.filter(lambda x:x is not None)
-#     return dataset
+max_seq_length = 1024
+lora_rank = 32
 
-import re
-from datasets import load_dataset, Dataset
+lora_rank = 32
+model, tokenizer = FastLanguageModel.get_peft_model(
+    model="unsloth/Llama-3.2-3B",
+    r=lora_rank,
+    target_modules = ["q_proj", "k_proj", "v_proj", "o_proj",
+                      "gate_proj", "up_proj", "down_proj"
+    ],
+    lora_alpha=16,
+    use_gradient_checkpointing="unsloth",
+    random_state=3407
+)
+
+
+model = FastLanguageModel.from_pretrained(
+  model,
+  max_seq_length=max_seq_length,
+  load_in_4bit=True,
+  fast_inference=True,
+  max_lora_rank=lora_rank,
+  gpu_memory_utilization=0.6
+)
+
 # Load and prep dataset
 SYSTEM_PROMPT = """
 Respond in the following format:
@@ -83,21 +78,6 @@ def get_gsm8k_questions(split="train")->Dataset:
 
 dataset = get_gsm8k_questions()
 
-
-model_name="meta-llama/meta-Llama-3.1-8B-Instruct",
-lora_rank = 32
-model, tokenizer = FastLanguageModel.get_peft_model(
-    model=model_name,
-    r=lora_rank,
-    target_modules = ["q_proj", "k_proj", "v_proj", "o_proj",
-                      "gate_proj", "up_proj", "down_proj"
-    ],
-    lora_alpha=16,
-    use_gradient_checkpointing="unsloth",
-    random_state=3407
-)
-
-
 # Reward functions
 def correctness_reward_func(prompts, completions, answer, **kwargs)->list[float]:
   responses = [completion[0]['content'] for completion in completions]
@@ -119,7 +99,7 @@ def strict_format_reward_func(complections, **kwards):
      pattern = r"^<reasoning>\n.*?\n</reasoning>\n<answer>\n.*?\n</answer>\n$"
      responses = [complection[0]["content"] for complection in complections]
      matches = [re.match(pattern, r) for r in responses]
-     return [0.5 if match else 0.0 match in matches]
+     return [0.5 if match else 0.0 for match in matches]
 
 def soft_format_reward_func(complections, **kwargs)->list[float]:
   """Reward function that checks if the completion has a specific format."""
@@ -146,6 +126,38 @@ def count_xml(text)->float:
 def xmlcount_reward_func(completions, **kwargs)->list[float]:
   contents = [completion[0]["content"] for completion in completions]
   return [count_xml(c) for c in contents]
+
+group_size = 8
+micro_group_size = 2
+lr = 5e-5
+weight_decay = 0.1
+reward_functions = [
+  correctness_reward_func,
+  int_reward_func,
+  strict_format_reward_func,
+  soft_format_reward_func,
+  count_xml
+]
+beta = 0.01
+print(model)
+
+ref_model = None
+trainer = GRPO(
+  model,
+  ref_model,
+  tokenizer=tokenizer,
+  group_size=group_size,
+  micro_group_size=micro_group_size,
+  dataset=dataset,
+  log_wandb=True,
+  lr=lr,
+  weight_decay=weight_decay,
+  beta=beta,
+  dtype=torch.bfloat16
+)
+
+trainer.train()
+
 
 
 
