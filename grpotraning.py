@@ -1,5 +1,3 @@
-#  i copy this code from github
-
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import Dataset, load_dataset
 from peft import LoraConfig, get_peft_model
