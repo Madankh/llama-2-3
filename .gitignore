@@ -5,6 +5,6 @@ Medicalfinetune.py
 inference.py
 experiments
 .env
-RAG_BASIC_TO_ADVANCE/basicrag.py
-RAG_BASIC_TO_ADVANCE/FusionRag.py
-RAG_BASIC_TO_ADVANCE/multiquery.py
+# RAG_BASIC_TO_ADVANCE/basicrag.py
+# RAG_BASIC_TO_ADVANCE/FusionRag.py
+# RAG_BASIC_TO_ADVANCE/multiquery.py

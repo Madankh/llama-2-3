@@ -196,8 +196,6 @@ class GRPO:
             torch.cuda.empty_cache() # gpu poor hack
 
 
-
-
             # offload to cpu to save vram
             batch_inputs = batch_inputs.cpu()
             rewards = rewards.cpu()
@@ -211,8 +209,6 @@ class GRPO:
                     b_old_policy_log_probs = self.get_per_token_logps(self.model, b_inputs.to(self.device)).cpu()
                     torch.cuda.empty_cache()
                     pi_old.append(b_old_policy_log_probs)
-
-            
 
             for _, (b_inputs,b_old_policy_log_probs, b_reward, b_loss_mask) in enumerate(zip(batch_inputs, pi_old, rewards, loss_mask)):
                 idx += 1
