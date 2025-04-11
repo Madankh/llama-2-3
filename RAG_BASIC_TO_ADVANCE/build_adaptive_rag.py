@@ -9,7 +9,14 @@ from langchain.prompts import ChatPromptTemplate
 from langchain_community.vectorstores import MongoDBAtlasVectorSearch
 from pymongo import MongoClient
 from langchain.load import dumps, loads
-from dotenv import load_dotenv
+from dotenv import load_dotenv 
+from langgraph.graph import START, StateGraph
+from typing_extensions import List, TypedDict
+from typing import Literal,List
+from langchain_core.prompts import ChatPromptTemplate
+from pydantic.v1 import BaseModel, Field
+from langchain_deepseek import ChatDeepSeek
+from langchain_core.runnables import RunnableMap, RunnablePassthrough
 import os
 
 ### Router
@@ -21,6 +28,7 @@ load_dotenv()
 Cohere = os.getenv("COHERE_API_KEY")
 llmKey =  os.getenv("llm")
 mongodb_conn_string = os.getenv("mongodb")
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 
 # Check if keys are loaded
 if not all([Cohere, llmKey, mongodb_conn_string]):
@@ -74,22 +82,17 @@ except Exception as e:
     exit()
 
 db_name = "DBbase"
-collection_name = "memory_router_test" # Use a distinct collection name
+collection_name = "memory_router" # Use a distinct collection name
 collection = client[db_name][collection_name]
 
-# --- Optional: Clear collection before indexing if testing ---
-# print(f"Clearing collection {db_name}.{collection_name}...")
-# collection.delete_many({})
-# -------------------------------------------------------------
-
-# Create the vector store using MongoDB Atlas
 print("Indexing documents into MongoDB Atlas Vector Search...")
 try:
     vectorstore = MongoDBAtlasVectorSearch.from_documents(
         documents=doc_splits,
         embedding=cohere_embeddings,
         collection=collection,
-        index_name="default"  # <<< MAKE SURE THIS INDEX NAME EXISTS IN ATLAS
+        index_name="vector_index",
+        relevance_score_fn="cosine",
     )
     print("Indexing complete.")
 except Exception as e:
@@ -99,186 +102,419 @@ except Exception as e:
 
 retriever = vectorstore.as_retriever()
 
-# Data Model
-class web_search(BaseModel):
-    """Select this route to perform a general web search.""" # Add docstring for clarity
-    query:str = Field(..., description="The query to use when searching the internet.")
+# Data model 
+class RouteQuery(BaseModel):
+    """Route a user query to the most relevant datasource."""
 
-class vectorstore_search(BaseModel): # Renamed for clarity
-    """Select this route to search the vectorstore containing information on agents, prompt engineering, and adversarial attacks.""" # Add docstring
-    query:str = Field(..., description="The query to use when searching the vectorstore.")
+    datasource: Literal["vectorstore", "web_search"] = Field(
+        ...,
+        description="Given a user question choose to route it to web search or a vectorstore.",
+    )
+llm = ChatDeepSeek(model="deepseek-chat", temperature=0,api_key=llmKey)
+structured_llm_router = llm.with_structured_output(RouteQuery)
 
-# System prompt containing routing instructions
-system_prompt = """You are an expert at routing a user question to a vectorstore or web search.
-The vectorstore contains documents related to AI agents, prompt engineering, and adversarial attacks against LLMs.
-Use the vectorstore_search for questions specifically about these topics based on the provided documents.
-Otherwise, use web_search for general questions, current events, or topics outside the scope of the documents."""
-
-# LLM with tool use and preamble
-# Use temperature 0 for deterministic routing
-llm = ChatDeepSeek(
-    model="deepseek-chat",
-    temperature=0, # Set temp to 0 for more deterministic routing
-    max_tokens=512,
-    api_key=llmKey)
-
-# Bind the tools (Pydantic models) to the LLM
-structured_llm_router = llm.bind_tools([web_search, vectorstore_search])
-
-# Create the prompt template including the system message
+# Prompt
+system = """You are an expert at routing a user question to a vectorstore or web search.
+The vectorstore contains documents related to agents, prompt engineering, and adversarial attacks.
+Use the vectorstore for questions on these topics. Otherwise, use web-search."""
 route_prompt = ChatPromptTemplate.from_messages(
     [
-        ("system", system_prompt), # <-- Include the routing instructions here
+        ("system", system),
         ("human", "{question}"),
     ]
 )
 
-# Create the actual router chain by combining the prompt and the LLM (with tools)
 question_router = route_prompt | structured_llm_router
+print(
+    question_router.invoke(
+        {"question": "Who will the Bears draft first in the NFL draft?"}
+    )
+)
+print(question_router.invoke({"question": "What are the types of agent memory?"}))
 
-# --- Now invoke the CHAIN ---
+#### Retrieval Grader
 
-print("\n--- Routing Test 1 (Vectorstore expected) ---")
-question1 = "what are the types of agents memory?"
-print(f"Question: {question1}")
-try:
-    response1 = question_router.invoke({"question": question1})
-    # Access tool calls directly from the response object
-    print(f"Tool Calls: {response1.tool_calls}")
-    # You can check the type of tool called if needed
-    if response1.tool_calls:
-        print(f"Tool Called: {response1.tool_calls}")
-        print(f"Tool Arguments: {response1.tool_calls[0]['args']}")
-except Exception as e:
-    print(f"Error during invocation 1: {e}")
-
-print("\n--- Routing Test 2 (Web Search expected) ---")
-question2 = "What's the weather like in London today?"
-print(f"Question: {question2}")
-try:
-    response2 = question_router.invoke({"question": question2})
-    print(f"Tool Calls: {response2.tool_calls}")
-    if response2.tool_calls:
-        print(f"Tool Called: {response2.tool_calls[0]['name']}")
-        print(f"Tool Arguments: {response2.tool_calls[0]['args']}")
-except Exception as e:
-    print(f"Error during invocation 2: {e}")
-
-print("\n--- Routing Test 3 (No tool expected / Direct Answer - depends on LLM) ---")
-
-question3 = "Hi how are you?"
-print(f"Question: {question3}")
-try:
-    response3 = question_router.invoke({"question": question3})
-    print(f"Tool Calls: {response3.tool_calls}") # Often [] or None for simple chat
-    if response3.tool_calls:
-         print(f"Tool Called: {response3.tool_calls[0]['name']}")
-         print(f"Tool Arguments: {response3.tool_calls[0]['args']}")
-    else:
-        # Print the direct LLM response content if no tool was called
-        print(f"Direct Response: {response3.content}")
-except Exception as e:
-    print(f"Error during invocation 3: {e}")
-
-# Regarding your original check:
-# response.tool_calls is the standard way to access tool calls in recent LangChain versions.
-# response.response_metadata might contain tool calls in older versions or specific setups,
-# but response.tool_calls is preferred.
-# If response.tool_calls is empty ([]), then no tool was called.
-
-# Example check:
-print(f"\nDid Test 3 call a tool? {'Yes' if response3.tool_calls else 'No'}")
-
-# Data model
 class GradeDocuments(BaseModel):
     """Binary score for relevance check on retrieved documents."""
+
     binary_score: str = Field(
         description="Documents are relevant to the question, 'yes' or 'no'"
     )
 
-# Grader Instructions (formerly preamble)
-grader_instructions = """You are a grader assessing relevance of a retrieved document to a user question.
-If the document contains keyword(s) or semantic meaning related to the user question, grade it as relevant.
-Give a binary score 'yes' or 'no' score to indicate whether the document is relevant to the question."""
-
-# LLM for the grader
-llm = ChatDeepSeek(
-    model="deepseek-chat",
-    temperature=0, # Use temperature 0 for deterministic grading
-    api_key=llmKey
-)
-
-# LLM with structured output, NO preamble argument here
+llm = ChatDeepSeek(model="deepseek-chat", temperature=0, api_key=llmKey)
 structured_llm_grader = llm.with_structured_output(GradeDocuments)
 
-# Prompt for the grader, INCLUDING instructions as a system message
+# Prompt
+system = """You are a grader assessing relevance of a retrieved document to a user question. \n 
+    If the document contains keyword(s) or semantic meaning related to the user question, grade it as relevant. \n
+    It does not need to be a stringent test. The goal is to filter out erroneous retrievals. \n
+    Give a binary score 'yes' or 'no' score to indicate whether the document is relevant to the question."""
+
+
 grade_prompt = ChatPromptTemplate.from_messages(
     [
-        ("system", grader_instructions), # <-- Include instructions here
+        ("system", system),
         ("human", "Retrieved document: \n\n {document} \n\n User question: {question}"),
     ]
 )
 
-# Grader chain
-retrieval_grader = grade_prompt | structured_llm_grader
+# Define the grader chain separately from retrieval
+retrieval_grader  = grade_prompt | structured_llm_grader
 
-# --- Test the Grader ---
+# Retrieve documents
 question = "types of agent memory"
-print(f"Retrieving documents for: {question}")
-retriever_chain = retriever.map() | StrOutputParser() 
-try:
-    docs = retriever_chain.invoke(question)
-    if not docs:
-        print("Retriever returned no documents.")
-    else:
-        print(f"Retrieved {len(docs)} documents. Grading the second document.")
-        # Ensure there is a second document before accessing it
-        if len(docs) > 1:
-            doc_text = docs[1].page_content # Use doc_text instead of doc_tex
-            print(f"\n--- Grading Document ---\n{doc_text[:500]}...\n----------------------")
-            response = retrieval_grader.invoke({"question": question, "document": doc_text})
-            print("\nGrader Response:")
-            print(response)
-        else:
-            print("Not enough documents retrieved to grade the second one.")
-
-except Exception as e:
-    print(f"An error occurred during retrieval or grading: {e}")
+docs = retriever.invoke(question)
+doc_txt = docs[1].page_content  # Get the second document's content
+# Grade one specific document
+response = retrieval_grader.invoke({
+    "question": question, 
+    "document": doc_txt
+})
+print(response)
 
 
-# --- Generation Setup ---
+### Generate
+from langchain import hub
+from langchain_core.output_parsers import StrOutputParser
 
-# Generation Instructions (preamble for the generator)
-generator_instructions = """You are an assistant for question-answering tasks. Use the following pieces of retrieved context to answer the question. If you don't know the answer, just say that you don't know. Use three sentences maximum and keep the answer concise."""
+prompt = ChatPromptTemplate.from_template("""
+You are an assistant for question-answering tasks. Use the following pieces of retrieved context to answer the question. If you don't know the answer, just say that you don't know. Use three sentences maximum and keep the answer concise.
+Document: {document}
+Question: {question}
+Answer:""")
 
-llm_generator = ChatDeepSeek(model="deepseek-chat", temperature=0, api_key=llmKey)
+#LLM
+llm = ChatDeepSeek(model="deepseek-chat", temperature=0, api_key=llmKey)
 
+# post-processing
 def format_docs(docs):
     return "\n\n".join(doc.page_content for doc in docs)
 
-generation_prompt = ChatPromptTemplate.from_messages(
+# chain
+rag_chain = prompt | llm | StrOutputParser()
+
+# Format the documents and run the chain
+formatted_docs = format_docs(docs)
+generation = rag_chain.invoke({"document": formatted_docs, "question": question})
+print(generation)
+
+### LLM fallback
+### LLM fallback
+
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.messages import HumanMessage, SystemMessage
+# Preamble
+preamble = """You are an assistant for question-answering tasks. Answer the question based upon your knowledge. Use three sentences maximum and keep the answer concise."""
+
+# LLM
+llm = ChatDeepSeek(model="deepseek-chat", temperature=0, api_key=llmKey)
+
+
+# Prompt
+def prompt(x):
+    return ChatPromptTemplate.from_messages(
+        [HumanMessage(f"Question: {x['question']} \nAnswer: ")]
+    )
+
+
+# Chain
+llm_chain = prompt | llm | StrOutputParser()
+
+# Run
+question = "Hi how are you?"
+generation = llm_chain.invoke({"question": question})
+print(generation)
+
+
+### Hallucination Grader
+# Data model
+class GradeHallucinations(BaseModel):
+    """
+    Binary score for hallucination present in generation answer."""
+
+    binary_score: str = Field(
+        description="Answer is grounded in the facts, 'yes' or 'no'"
+    )
+
+
+# LLM with function call
+llm = ChatDeepSeek(model="deepseek-chat", temperature=0, api_key=llmKey)
+structured_llm_grader = llm.with_structured_output(
+    GradeHallucinations
+)
+
+# Prompt
+hallucination_prompt = ChatPromptTemplate.from_messages(
     [
-        ("system", generator_instructions + "\n\nContext:\n{context}"), # Include instructions and context placeholder
-        ("human", "Question: {question}"), # Keep human message clean
+        # ("system", preamble),
+        ("human", "Set of facts: \n\n {documents} \n\n LLM generation: {generation}"),
     ]
 )
 
-# Generation Chain
-rag_chain = (
-    # Pass question and documents through, format documents for the prompt
-    {"context": lambda x: format_docs(x["documents"]), "question": itemgetter("question")}
-    | generation_prompt
-    | llm_generator
-    | StrOutputParser()
+hallucination_grader = hallucination_prompt | structured_llm_grader
+hallucination = hallucination_grader.invoke({"documents": docs, "generation": generation})
+print(hallucination, "hallucination")
+
+
+# Data model
+class GradeAnswer(BaseModel):
+    """
+    Give a binary score 'yes' or 'no'. Yes' means that the answer resolves the question.
+    Binary score to assess answer addresses question."""
+
+    binary_score: str = Field(
+        description="Answer addresses the question, 'yes' or 'no'"
+    )
+
+# LLM with function call
+llm = ChatDeepSeek(model="deepseek-chat", temperature=0, api_key=llmKey)
+structured_llm_grader = llm.with_structured_output(GradeAnswer)
+
+# Prompt
+answer_prompt = ChatPromptTemplate.from_messages(
+    
+    ("human", "User question: \n\n {question} \n\n LLM generation: {generation}"),
+
 )
-if docs: 
-    print("\n--- Generating Answer ---")
-    try:
-        relevant_docs = docs # Replace this with filtered docs if grader logic is added
-        generation = rag_chain.invoke({"documents": relevant_docs, "question": question})
-        print("\nGenerated Answer:")
-        print(generation)
-    except Exception as e:
-        print(f"An error occurred during generation: {e}")
-else:
-    print("\nSkipping generation because no documents were retrieved.")
+
+answer_grader = answer_prompt | structured_llm_grader
+answer =answer_grader.invoke({"question": question, "generation": generation})
+print(answer, "answer_grader")
+
+####  Search
+from langchain_community.tools.tavily_search import TavilySearchResults
+web_search_tool = TavilySearchResults()
+
+from typing_extensions import TypedDict
+
+class GraphState(TypedDict):
+    """
+    Represents the state of our graph
+    """
+    question:str
+    generation:str
+    documents:List[str]
+
+from langchain.schema import Document
+
+def retrieve(state):
+    """
+    Retrive docs
+
+    """
+    question = state["question"]
+    documents = retriever.invoke(question)
+    return {"documents":documents, "question":question}
+
+def llm_fallback(state):
+    question = state["question"]
+    generation = llm_chain.invoke({"question":question})
+    return {"question":question, "generation":generation}
+
+def generate(state):
+    print("---GENERATE---")
+    question = state["question"]
+    documents = state["documents"]
+    if not isinstance(documents, list):
+        documents = [documents]
+
+    # Format documents to a single string
+    formatted_docs = format_docs(documents)  
+    
+    # Pass document (singular) to match the prompt template
+    generation = rag_chain.invoke({"document": formatted_docs, "question": question})
+    return {"documents": documents, "question": question, "generation": generation}
+
+
+def grade_documents(state):
+    """
+    Determines whether the retrieved documents are relevant to the question.
+
+    Args:
+        state (dict): The current graph state
+
+    Returns:
+        state (dict): Updates documents key with only filtered relevant documents
+    """
+
+    print("---CHECK DOCUMENT RELEVANCE TO QUESTION---")
+    question = state["question"]
+    documents = state["documents"]
+
+    # Score each doc
+    filtered_docs = []
+    for d in documents:
+        score = retrieval_grader.invoke(
+            {"question": question, "document": d.page_content}
+        )
+        grade = score.binary_score
+        if grade == "yes":
+            print("---GRADE: DOCUMENT RELEVANT---")
+            filtered_docs.append(d)
+        else:
+            print("---GRADE: DOCUMENT NOT RELEVANT---")
+            continue
+    return {"documents": filtered_docs, "question": question}
+
+
+def web_search(state):
+    """
+    Web search based on the re-phrased question.
+
+    Args:
+        state (dict): The current graph state
+
+    Returns:
+        state (dict): Updates documents key with appended web results
+    """
+
+    print("---WEB SEARCH---")
+    question = state["question"]
+
+    # Web search
+    docs = web_search_tool.invoke({"query": question})
+    web_results = "\n".join([d["content"] for d in docs])
+    web_results = Document(page_content=web_results)
+
+    return {"documents": web_results, "question": question}
+
+
+### Edges ###
+
+
+def route_question(state):
+    """
+    Route question to web search or RAG.
+
+    Args:
+        state (dict): The current graph state
+
+    Returns:
+        str: Next node to call
+    """
+
+    print("---ROUTE QUESTION---")
+    question = state["question"]
+    source = question_router.invoke({"question": question})
+
+    
+
+    # Choose datasource
+    datasource = source.datasource
+    if datasource == "web_search":
+        print("---ROUTE QUESTION TO WEB SEARCH---")
+        return "web_search"
+    elif datasource == "vectorstore":
+        print("---ROUTE QUESTION TO RAG---")
+        return "vectorstore"
+    else:
+        print("---ROUTE QUESTION TO LLM---")
+        return "vectorstore"
+
+
+def decide_to_generate(state):
+    state["question"]
+    filtered_documents = state["documents"]
+
+    if not filtered_documents:
+        # All documents have been filtered check_relevance
+        # We will re-generate a new query
+        print("---DECISION: ALL DOCUMENTS ARE NOT RELEVANT TO QUESTION, WEB SEARCH---")
+        return "web_search"
+    else:
+        # We have relevant documents, so generate answer
+        print("---DECISION: GENERATE---")
+        return "generate"
+
+
+def grade_generation_v_documents_and_question(state):
+
+    print("---CHECK HALLUCINATIONS---")
+    question = state["question"]
+    documents = state["documents"]
+    generation = state["generation"]
+
+    score = hallucination_grader.invoke(
+        {"documents": documents, "generation": generation}
+    )
+    grade = score.binary_score
+
+    # Check hallucination
+    if grade == "yes":
+        print("---DECISION: GENERATION IS GROUNDED IN DOCUMENTS---")
+        # Check question-answering
+        print("---GRADE GENERATION vs QUESTION---")
+        score = answer_grader.invoke({"question": question, "generation": generation})
+        grade = score.binary_score
+        if grade == "yes":
+            print("---DECISION: GENERATION ADDRESSES QUESTION---")
+            return "useful"
+        else:
+            print("---DECISION: GENERATION DOES NOT ADDRESS QUESTION---")
+            return "not useful"
+    else:
+        print("---DECISION: GENERATION IS NOT GROUNDED IN DOCUMENTS, RE-TRY---")
+        return "not supported"
+
+
+
+
+import pprint
+from langgraph.graph import END, StateGraph, START
+
+workflow = StateGraph(GraphState)
+
+# Define the nodes
+workflow.add_node("web_search", web_search)
+workflow.add_node("retrieve", retriever)
+workflow.add_node("grade_documents", grade_documents)
+workflow.add_node('generate', generate)
+workflow.add_node('llm_fallback', llm_fallback)
+
+# Build graph
+workflow.add_conditional_edges(
+    START,
+    route_question,
+    {
+        "web_search": "web_search",
+        "vectorstore": "retrieve",
+        "llm_fallback": "llm_fallback",
+    },
+)
+workflow.add_edge("web_search", "generate")
+workflow.add_edge("retrieve", "grade_documents")
+workflow.add_conditional_edges(
+    "grade_documents",
+    decide_to_generate,
+    {
+        "web_search": "web_search",
+        "generate": "generate",
+    },
+)
+workflow.add_conditional_edges(
+    "generate",
+    grade_generation_v_documents_and_question,
+    {
+        "not supported": "generate",  # Hallucinations: re-generate
+        "not useful": "web_search",  # Fails to answer question: fall-back to web-search
+        "useful": END,
+    },
+)
+workflow.add_edge("llm_fallback", END)
+
+# Compile
+app = workflow.compile()
+
+# Run
+inputs = {
+    "question": "Is the U.S. stock market still performing poorly today?"
+}
+for output in app.stream(inputs):
+    for key, value in output.items():
+        # Node
+        pprint.pprint(f"Node '{key}':")
+        # Optional: print full state at each node
+    pprint.pprint("\n---\n")
+
+# Final generation
+pprint.pprint(value["generation"])

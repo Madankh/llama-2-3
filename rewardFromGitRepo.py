@@ -39,12 +39,7 @@ def prepare_dataset(dataset) -> Dataset:
 
     return dataset
 
-
-
-
-
 model_name = "unsloth/Llama-3.2-3B-Instruct"
-
 
 model = AutoModelForCausalLM.from_pretrained(model_name)
 tokenizer = AutoTokenizer.from_pretrained(model_name)
