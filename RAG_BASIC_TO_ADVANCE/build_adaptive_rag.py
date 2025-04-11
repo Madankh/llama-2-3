@@ -106,7 +106,7 @@ retriever = vectorstore.as_retriever()
 class RouteQuery(BaseModel):
     """Route a user query to the most relevant datasource."""
 
-    datasource: Literal["vectorstore", "web_search"] = Field(
+    datasource: Literal["vectorstore", "web_search", "llm_fallback"] = Field(
         ...,
         description="Given a user question choose to route it to web search or a vectorstore.",
     )
@@ -114,9 +114,12 @@ llm = ChatDeepSeek(model="deepseek-chat", temperature=0,api_key=llmKey)
 structured_llm_router = llm.with_structured_output(RouteQuery)
 
 # Prompt
-system = """You are an expert at routing a user question to a vectorstore or web search.
-The vectorstore contains documents related to agents, prompt engineering, and adversarial attacks.
-Use the vectorstore for questions on these topics. Otherwise, use web-search."""
+system = """You are an expert at routing a user question to a vectorstore, web search, or llm_fallback.
+            The vectorstore contains documents related to agents, prompt engineering, and adversarial attacks.
+            Use the vectorstore for questions on these topics.
+            For scientific questions requiring established knowledge, use llm_fallback.
+            For questions requiring current information or topics outside your knowledge base, use web-search."""
+
 route_prompt = ChatPromptTemplate.from_messages(
     [
         ("system", system),
@@ -133,7 +136,6 @@ print(
 print(question_router.invoke({"question": "What are the types of agent memory?"}))
 
 #### Retrieval Grader
-
 class GradeDocuments(BaseModel):
     """Binary score for relevance check on retrieved documents."""
 
@@ -158,14 +160,12 @@ grade_prompt = ChatPromptTemplate.from_messages(
     ]
 )
 
-# Define the grader chain separately from retrieval
 retrieval_grader  = grade_prompt | structured_llm_grader
 
 # Retrieve documents
 question = "types of agent memory"
 docs = retriever.invoke(question)
 doc_txt = docs[1].page_content  # Get the second document's content
-# Grade one specific document
 response = retrieval_grader.invoke({
     "question": question, 
     "document": doc_txt
@@ -227,7 +227,6 @@ print(generation)
 
 
 ### Hallucination Grader
-# Data model
 class GradeHallucinations(BaseModel):
     """
     Binary score for hallucination present in generation answer."""
@@ -397,8 +396,6 @@ def route_question(state):
     question = state["question"]
     source = question_router.invoke({"question": question})
 
-    
-
     # Choose datasource
     datasource = source.datasource
     if datasource == "web_search":
@@ -409,7 +406,7 @@ def route_question(state):
         return "vectorstore"
     else:
         print("---ROUTE QUESTION TO LLM---")
-        return "vectorstore"
+        return "llm_fallback"
 
 
 def decide_to_generate(state):
@@ -507,8 +504,9 @@ app = workflow.compile()
 
 # Run
 inputs = {
-    "question": "Is the U.S. stock market still performing poorly today?"
+    "question": "what is atom?"
 }
+
 for output in app.stream(inputs):
     for key, value in output.items():
         # Node
