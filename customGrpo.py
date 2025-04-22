@@ -188,11 +188,8 @@ class GRPO:
             x_batch_inputs, rewards, loss_mask = self.sample_batch()
             torch.cuda.empty_cache() 
 
-            
-
-
-            batch_inputs = x_batch_inputs.reshape(self.batch_size, self.group_size, *x_batch_inputs.shape[1:])
-            loss_mask =       loss_mask.reshape(self.batch_size, self.group_size, *loss_mask.shape[1:])
+            batch_inputs = x_batch_inputs.reshape(self.batch_size, self.group_size, x_batch_inputs.shape[1:])
+            loss_mask =       loss_mask.reshape(self.batch_size, self.group_size, loss_mask.shape[1:])
             torch.cuda.empty_cache() # gpu poor hack
 
 
@@ -218,10 +215,10 @@ class GRPO:
 
                 # even grop are too big for vram
                 # so we split them into micro groups (its same as micro batching)
-                g_inputs                =                b_inputs.reshape(b_inputs.shape[0]//self.micro_group_size,self.micro_group_size, *b_inputs.shape[1:]).cpu()
-                g_old_policy_log_probs  =  b_old_policy_log_probs.reshape(b_inputs.shape[0]//self.micro_group_size,self.micro_group_size, *b_old_policy_log_probs.shape[1:]).cpu()
-                g_reward =                               b_reward.reshape(b_inputs.shape[0]//self.micro_group_size,self.micro_group_size, *b_reward.shape[1:]).cpu()
-                g_loss_mask =                         b_loss_mask.reshape(b_inputs.shape[0]//self.micro_group_size,self.micro_group_size, *b_loss_mask.shape[1:]).cpu()
+                g_inputs                =                b_inputs.reshape(b_inputs.shape[0]//self.micro_group_size,self.micro_group_size, b_inputs.shape[1:]).cpu()
+                g_old_policy_log_probs  =  b_old_policy_log_probs.reshape(b_inputs.shape[0]//self.micro_group_size,self.micro_group_size, b_old_policy_log_probs.shape[1:]).cpu()
+                g_reward =                               b_reward.reshape(b_inputs.shape[0]//self.micro_group_size,self.micro_group_size, b_reward.shape[1:]).cpu()
+                g_loss_mask =                         b_loss_mask.reshape(b_inputs.shape[0]//self.micro_group_size,self.micro_group_size, b_loss_mask.shape[1:]).cpu()
                 group_losses = []
                 
 
