@@ -1,5 +1,5 @@
-In this repo, I’ve added several LLM-related applications. First, I trained an LLM, then used GRPO to train a reasoning model. The repo also includes a RAG-based application.
+In this repository, I’ve included several LLM-related projects. I started by training an LLM, then implemented GRPO from scratch. Using GRPO, I trained reasoning models in two ways: one with my custom GRPO implementation and another using the Hugging Face library.
 
-In customGrpo.py, I implemented a custom GRPO setup for training reasoning models, and you can use grpotraining.py to run the training process.
+The file customGrpo.py contains my custom GRPO setup for training reasoning models, and customgrpotrain.py , grpotraining.py is used to run the training process. Additionally, train.py is used to train a LLaMA model.
 
-This project is just a fun way for me to learn and experiment, so the documentation is not great, I haven’t had the time to write everything out. It’s not a commercial project.
+This project is a personal learning experiment, not intended for commercial use. As such, the documentation is minimal—I haven’t had time to fully write everything out.
